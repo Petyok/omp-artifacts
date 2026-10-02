@@ -25,10 +25,9 @@
  * `action send_key alt+o`). Only the title is a link: kitty underlines a hovered link
  * on every cell it covers, which across the whole card looked like static.
  *
- * Needs kitty (or Ghostty) graphics with Unicode placeholders, and a Chromium binary
- * (OMP_ARTIFACTS_BROWSER overrides the lookup). One Chromium serves the whole omp
- * process and closes after IDLE_CLOSE_MS without use; writing an .html or .md starts
- * it in the background so the first view does not wait for it.
+ * Needs kitty (or Ghostty) graphics with Unicode placeholders. Pages render in omp's
+ * own project-shared headless Chromium (render.ts); writing an .html or .md connects
+ * to it in the background so the first view does not wait.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -83,8 +82,7 @@ const CELL_HEIGHT_AT_1X = 17;
 const MAX_LIVE_CHUNKS = 5;
 /** Rows moved per wheel notch and per j/k. */
 const WHEEL_ROWS = 3;
-const IDLE_CLOSE_MS = 10 * 60_000;
-/** Writes of these warm Chromium up and become the bare-/view fallback. */
+/** Writes of these connect to the browser early and become the bare-/view fallback. */
 const PREWARM_RE = /\.(html?|md|markdown)$/i;
 /** Opens the queue head; unbound in omp's default keymap. */
 const SHORTCUT = "alt+o";
@@ -117,41 +115,21 @@ function openExternally(url: string): void {
 	Bun.spawn([process.platform === "darwin" ? "open" : "xdg-open", url], { stdin: "ignore", stdout: "ignore", stderr: "ignore" }).unref();
 }
 
-// ── shared Chromium ─────────────────────────────────────────────────────────
+// ── browser connection ──────────────────────────────────────────────────────
 
-let sharedRenderer: HtmlRenderer | undefined;
-let launching: Promise<HtmlRenderer> | undefined;
-let rendererUsers = 0;
-let idleTimer: Timer | undefined;
+/** Session cwd: omp's shared browser is per project. */
+let projectDir = process.cwd();
+let connection: Promise<HtmlRenderer> | undefined;
 
-function acquireRenderer(): Promise<HtmlRenderer> {
-	rendererUsers++;
-	clearTimeout(idleTimer);
-	idleTimer = undefined;
-	if (sharedRenderer?.alive) return Promise.resolve(sharedRenderer);
-	launching ??= HtmlRenderer.launch()
-		.then(renderer => {
-			sharedRenderer = renderer;
-			return renderer;
-		})
-		.finally(() => {
-			launching = undefined;
-		});
-	return launching;
+/** One connection per omp process, reopened when the browser went away. */
+async function getRenderer(): Promise<HtmlRenderer> {
+	const seen = connection;
+	const current = seen && (await seen.catch(() => undefined));
+	if (current?.alive) return current;
+	// Concurrent callers that saw the same dead connection share one reconnect.
+	if (connection === seen || !connection) connection = HtmlRenderer.connect(projectDir);
+	return connection;
 }
-
-function releaseRenderer(): void {
-	rendererUsers = Math.max(0, rendererUsers - 1);
-	if (rendererUsers > 0) return;
-	clearTimeout(idleTimer);
-	idleTimer = setTimeout(() => {
-		sharedRenderer?.close();
-		sharedRenderer = undefined;
-	}, IDLE_CLOSE_MS);
-	idleTimer.unref();
-}
-
-process.once("exit", () => sharedRenderer?.close());
 
 // ── kitty images ────────────────────────────────────────────────────────────
 
@@ -185,23 +163,18 @@ function renderThumb(target: Target, cols: number, rows: number): Promise<string
 	const cached = thumbCachePath(target, widthPx, heightPx);
 	if (fs.existsSync(cached)) return Promise.resolve(fs.readFileSync(cached).toString("base64"));
 	const job = thumbChain.then(async () => {
-		const renderer = await acquireRenderer();
+		const page = await (await getRenderer()).openPage();
 		try {
-			const page = await renderer.openPage();
-			try {
-				const scale = widthPx / DESKTOP_CSS_WIDTH;
-				const cssHeight = heightPx / scale;
-				const viewport = { width: DESKTOP_CSS_WIDTH, height: Math.round(cssHeight), deviceScaleFactor: 1, mobile: false };
-				await page.load(await pageUrl(target), viewport);
-				const png = await page.capture(0, DESKTOP_CSS_WIDTH, cssHeight, scale);
-				fs.mkdirSync(path.dirname(cached), { recursive: true });
-				fs.writeFileSync(cached, Buffer.from(png, "base64"));
-				return png;
-			} finally {
-				page.close();
-			}
+			const scale = widthPx / DESKTOP_CSS_WIDTH;
+			const cssHeight = heightPx / scale;
+			const viewport = { width: DESKTOP_CSS_WIDTH, height: Math.round(cssHeight), deviceScaleFactor: 1, mobile: false };
+			await page.load(await pageUrl(target), viewport);
+			const png = await page.capture(0, DESKTOP_CSS_WIDTH, cssHeight, scale);
+			fs.mkdirSync(path.dirname(cached), { recursive: true });
+			fs.writeFileSync(cached, Buffer.from(png, "base64"));
+			return png;
 		} finally {
-			releaseRenderer();
+			page.close();
 		}
 	});
 	thumbChain = job.catch(() => {});
@@ -247,7 +220,7 @@ class HtmlViewer implements Component {
 	#pageRows = 0;
 	#topRow = 0;
 	#chunks = new Map<number, Placed>();
-	#status = "starting Chromium…";
+	#status = "connecting to the browser…";
 	#error = false;
 	#running = false;
 	/** A kick arrived while the worker was running; run it again once it exits. */
@@ -259,21 +232,15 @@ class HtmlViewer implements Component {
 		this.#theme = theme;
 		this.#done = done;
 		this.#target = target;
-		acquireRenderer()
+		getRenderer()
 			.then(renderer => renderer.openPage())
 			.then(
 				page => {
-					if (this.#disposed) {
-						page.close();
-						return releaseRenderer();
-					}
+					if (this.#disposed) return page.close();
 					this.#page = page;
 					this.#kick();
 				},
-				err => {
-					releaseRenderer();
-					this.#fail(err);
-				},
+				err => this.#fail(err),
 			);
 	}
 
@@ -350,11 +317,8 @@ class HtmlViewer implements Component {
 		if (this.#disposed) return;
 		this.#disposed = true;
 		this.#dropChunks();
-		// Still launching: the acquire callback closes and releases once it sees #disposed.
-		if (this.#page) {
-			this.#page.close();
-			releaseRenderer();
-		}
+		// Still connecting: the open callback closes the tab once it sees #disposed.
+		this.#page?.close();
 	}
 
 	#measure(width: number, rows: number): Geometry {
@@ -965,6 +929,7 @@ export default function htmlView(pi: ExtensionAPI): void {
 	let lastWritten: string | undefined;
 
 	pi.on("session_start", (_event, ctx) => {
+		projectDir = ctx.cwd;
 		if (!ctx.hasUI) return;
 		// A new or resumed session starts without our widget; mount it again if the queue has items.
 		mainUi = ctx.ui;
@@ -977,8 +942,8 @@ export default function htmlView(pi: ExtensionAPI): void {
 		const p = event.input.path;
 		if (typeof p !== "string" || !PREWARM_RE.test(p) || p.includes("://")) return undefined;
 		lastWritten = path.resolve(ctx.cwd, p);
-		// Warm the shared browser so a view does not wait ~2 s for Chromium to start.
-		if (ctx.hasUI) void acquireRenderer().then(releaseRenderer, releaseRenderer);
+		// Connect early, so a view does not wait for omp's browser to start.
+		if (ctx.hasUI) void getRenderer().catch(() => {});
 		return undefined;
 	});
 

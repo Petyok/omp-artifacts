@@ -8,7 +8,7 @@ mouse wheel. Everything you were shown stays in a searchable library.
 
 - **Preview queue.** The agent calls `show_artifact`. A card with a thumbnail shows the newest item;
   more items stack behind it (`1 of 5`). `alt+o`, or a click on the card title, opens it.
-- **Viewer.** A full-screen, scrollable render of the page, made by headless Chromium and drawn with
+- **Viewer.** A full-screen, scrollable render of the page, made by omp's own headless Chromium and drawn with
   kitty graphics. `m` switches to a 390 px phone layout.
 - **Artifact Library.** `alt+shift+o` lists everything ever shown or viewed, with thumbnails,
   type-to-filter and the queued items tagged.
@@ -28,7 +28,7 @@ Restart omp. Requirements:
 |---|---|
 | omp | built and tested on 18.3.1 |
 | Terminal | [kitty](https://sw.kovidgoyal.net/kitty/) (tested on 0.48); needs its graphics protocol with Unicode placeholders. Ghostty supports the same protocol but is untested |
-| Browser | Chromium, Chrome or Brave on `PATH`, or set `OMP_ARTIFACTS_BROWSER=/path/to/chrome` |
+| Browser | none of its own: pages render in the headless Chromium omp already runs for its `browser` tool |
 | PDF | `pdftoppm` from poppler (only for PDFs) |
 | OS | Linux. macOS should work but is untested |
 
@@ -89,10 +89,10 @@ Everything but HTML and URLs gets a small header with the file name, folder, siz
 
 ## How it works
 
-- One headless Chromium per omp process renders the page at a viewport sized to your terminal in
-  pixels. It starts in the background as soon as the agent writes an `.html` or `.md`, and closes after
-  10 minutes of no use. It runs under `setpriv --pdeathsig` (util-linux, when present), so it never
-  outlives omp, even if omp crashes.
+- Pages render in omp's project-shared headless Chromium, the one its `browser` tool uses, at a viewport
+  sized to your terminal in pixels. omp starts and stops that browser; the plugin only connects, as soon as
+  the agent writes an `.html` or `.md`. Its tabs sit in a browser context of their own that Chromium
+  disposes when the connection drops, so a crashed omp leaves no tabs behind.
 - The page is captured in screen-tall strips. Each strip is sent to kitty once and drawn through Unicode
   placeholders, where every cell names its own image row, so scrolling only reprints text. At most five
   strips stay in kitty's memory.

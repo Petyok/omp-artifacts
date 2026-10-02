@@ -69,8 +69,8 @@ In the viewer:
 | `q`, `Esc` | close |
 
 In the library: `Tab` switches between this project and all projects, type to filter (try `queued`, or a
-project folder), `↑` `↓` or the wheel to move, `Enter` or a click to open, `Del` to forget an entry (the
-file stays), `ctrl+o` to open in the browser, `Esc` to close.
+project folder), `↑` `↓` or the wheel to move, `Enter` or a click to open, `ctrl+d` (or `Del`) to forget an
+entry (the file stays), `ctrl+o` to open in the browser, `Esc` to close.
 
 ![Markdown in the viewer](docs/viewer-markdown.webp)
 

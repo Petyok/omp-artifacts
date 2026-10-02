@@ -771,7 +771,7 @@ class ArtifactLibrary implements Component {
 		while (lines.length < rows - LIB_FOOTER_ROWS) lines.push("");
 		lines.length = rows - LIB_FOOTER_ROWS;
 		lines.push(t.fg("dim", "─".repeat(width)));
-		const help = `tab ${this.#allProjects ? "this project" : "all projects"} · ↑↓ wheel move · enter click open · del forget · ctrl+o browser · esc close`;
+		const help = `tab ${this.#allProjects ? "this project" : "all projects"} · ↑↓ wheel move · enter click open · ctrl+d forget · ctrl+o browser · esc close`;
 		const status = this.#status ? `${t.fg("warning", this.#status)}  ` : "";
 		lines.push(truncateToWidth(` ${status}${t.fg("dim", help)}`, width));
 		return lines;

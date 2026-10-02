@@ -10,8 +10,8 @@ mouse wheel. Everything you were shown stays in a searchable library.
   more items stack behind it (`1 of 5`). `alt+o`, or a click on the card title, opens it.
 - **Viewer.** A full-screen, scrollable render of the page, made by omp's own headless Chromium and drawn with
   kitty graphics. `m` switches to a 390 px phone layout.
-- **Artifact Library.** `alt+shift+o` lists everything ever shown or viewed, with thumbnails,
-  type-to-filter and the queued items tagged.
+- **Artifact Library.** `alt+shift+o` lists everything shown or viewed in this project, with
+  thumbnails, type-to-filter and the queued items tagged; `Tab` switches to all projects.
 - **Formats.** HTML, Markdown, plain text and code, images, PDF, and http(s) URLs.
 
 ![HTML in the viewer](docs/viewer-html.webp)
@@ -68,8 +68,9 @@ In the viewer:
 | `o` | open in your normal browser |
 | `q`, `Esc` | close |
 
-In the library: type to filter (try `queued`), `↑` `↓` or the wheel to move, `Enter` or a click to
-open, `Del` to forget an entry (the file stays), `ctrl+o` to open in the browser, `Esc` to close.
+In the library: `Tab` switches between this project and all projects, type to filter (try `queued`, or a
+project folder), `↑` `↓` or the wheel to move, `Enter` or a click to open, `Del` to forget an entry (the
+file stays), `ctrl+o` to open in the browser, `Esc` to close.
 
 ![Markdown in the viewer](docs/viewer-markdown.webp)
 
@@ -97,7 +98,11 @@ Everything but HTML and URLs gets a small header with the file name, folder, siz
   placeholders, where every cell names its own image row, so scrolling only reprints text. At most five
   strips stay in kitty's memory.
 - The library is `artifact-library.json` in omp's agent folder (`~/.omp/agent`), shared by all omp
-  windows, newest 500 entries. Rendered pages and thumbnails are cached in `~/.cache/omp-artifacts`.
+  windows. Each entry remembers the folder its omp session ran in; that folder is "this project", the
+  same way omp scopes its sessions. It keeps the 500 most recently shown entries across all projects;
+  older ones drop off the list, the files stay. Rendered pages and thumbnails are cached in
+  `~/.cache/omp-artifacts`; anything there unused for 30 days is deleted when omp starts and rebuilt
+  on the next view.
 
 ## Limits
 

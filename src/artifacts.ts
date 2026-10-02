@@ -33,6 +33,8 @@ const LIBRARY_MAX = 500;
 const TEXT_MAX_BYTES = 2 * 1024 * 1024;
 const PDF_MAX_PAGES = 60;
 const PDF_DPI = 110;
+/** Cache entries unused this long are deleted at startup; the next view rebuilds them. */
+const CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
 
 const KIND_BY_EXT: Record<string, Kind> = {
 	html: "html",
@@ -181,7 +183,7 @@ async function renderPdfPages(file: string, mtimeMs: number): Promise<string[]> 
 		});
 		if ((await proc.exited) !== 0) throw new Error(`pdftoppm failed: ${(await new Response(proc.stderr).text()).trim()}`);
 		fs.writeFileSync(stamp, String(mtimeMs));
-	}
+	} else touchCache(dir);
 	return fs
 		.readdirSync(dir)
 		.filter(f => f.endsWith(".png"))
@@ -226,6 +228,30 @@ export async function pageUrl(target: Target): Promise<string> {
 export function thumbCachePath(target: Target, widthPx: number, heightPx: number): string {
 	const version = fileInfo(target)?.mtimeMs ?? 0;
 	return path.join(CACHE_DIR, "thumbs", `${hash(`${target.source}|${version}|${widthPx}x${heightPx}`)}.png`);
+}
+
+/** Marks a cache entry as used, so {@link sweepCache} keeps it. */
+export function touchCache(p: string): void {
+	const now = new Date();
+	try {
+		fs.utimesSync(p, now, now);
+	} catch {}
+}
+
+/**
+ * Deletes cache entries (a thumbnail, a wrapper page, a PDF's page folder as a whole) not written
+ * or reused for CACHE_MAX_AGE_MS. Always safe: a missing entry is rebuilt on the next view.
+ */
+export async function sweepCache(): Promise<void> {
+	const now = Date.now();
+	for (const sub of ["render", "thumbs"]) {
+		const dir = path.join(CACHE_DIR, sub);
+		for (const name of await fs.promises.readdir(dir).catch(() => [])) {
+			const p = path.join(dir, name);
+			const stat = await fs.promises.lstat(p).catch(() => undefined);
+			if (stat && now - stat.mtimeMs > CACHE_MAX_AGE_MS) await fs.promises.rm(p, { recursive: true, force: true });
+		}
+	}
 }
 
 // ── library ─────────────────────────────────────────────────────────────────

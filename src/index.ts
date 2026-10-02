@@ -65,8 +65,10 @@ import {
 	recordInLibrary,
 	resolveTarget,
 	type Target,
+	sweepCache,
 	thumbCachePath,
 	tildify,
+	touchCache,
 } from "./artifacts.ts";
 import { HtmlRenderer, type RendererPage, type Viewport } from "./render.ts";
 
@@ -161,7 +163,10 @@ function renderThumb(target: Target, cols: number, rows: number): Promise<string
 	const widthPx = cols * cell.widthPx;
 	const heightPx = rows * cell.heightPx;
 	const cached = thumbCachePath(target, widthPx, heightPx);
-	if (fs.existsSync(cached)) return Promise.resolve(fs.readFileSync(cached).toString("base64"));
+	if (fs.existsSync(cached)) {
+		touchCache(cached);
+		return Promise.resolve(fs.readFileSync(cached).toString("base64"));
+	}
 	const job = thumbChain.then(async () => {
 		const page = await (await getRenderer()).openPage();
 		try {
@@ -678,9 +683,10 @@ const LIB_FOOTER_ROWS = 2;
 const ITEM_ROWS = 4;
 
 /**
- * Fullscreen list of every artifact shown or viewed, newest first:
+ * Fullscreen list of the artifacts shown or viewed in this project (the session's working
+ * directory, as omp itself scopes projects), newest first; tab switches to all projects:
  *
- *    Artifact Library  12 artifacts                         filter: net▏
+ *    Artifact Library  ~/reports · 12 artifacts                    filter: net▏
  *   ─────────────────────────────────────────────────────────────────────
  *   ▌[thumbnail]   Quarterly report                              2 h ago
  *   ▌              HTML · 217 KB · ~/reports
@@ -692,6 +698,8 @@ class ArtifactLibrary implements Component {
 	#tui: TUI;
 	#theme: ViewerTheme;
 	#done: () => void;
+	#cwd: string;
+	#allProjects = false;
 	#handle?: OverlayHandle;
 	#all: LibraryEntry[] = loadLibrary();
 	#filter = "";
@@ -704,10 +712,11 @@ class ArtifactLibrary implements Component {
 	#status = "";
 	#disposed = false;
 
-	constructor(tui: TUI, theme: ViewerTheme, done: () => void) {
+	constructor(tui: TUI, theme: ViewerTheme, done: () => void, cwd: string) {
 		this.#tui = tui;
 		this.#theme = theme;
 		this.#done = done;
+		this.#cwd = cwd;
 	}
 
 	setHandle(handle: OverlayHandle): void {
@@ -724,15 +733,22 @@ class ArtifactLibrary implements Component {
 		if (this.#selected >= this.#top + this.#visible) this.#top = this.#selected - this.#visible + 1;
 		this.#top = Math.max(0, Math.min(this.#top, Math.max(0, items.length - this.#visible)));
 
-		const queued = this.#all.filter(e => isQueued(e.source)).length;
-		const count = this.#filter ? `${items.length} of ${this.#all.length}` : `${this.#all.length} artifacts`;
-		const title = `${t.bold(" Artifact Library")}  ${t.fg("muted", count)}${queued ? t.fg("accent", ` · ${queued} queued`) : ""}`;
+		const pool = this.#pool();
+		const queued = pool.filter(e => isQueued(e.source)).length;
+		const scope = this.#allProjects ? "all projects" : tildify(this.#cwd);
+		const count = this.#filter ? `${items.length} of ${pool.length}` : `${pool.length} artifacts`;
+		const title = `${t.bold(" Artifact Library")}  ${t.fg("muted", `${scope} · ${count}`)}${queued ? t.fg("accent", ` · ${queued} queued`) : ""}`;
 		const filter = this.#filter ? `${t.fg("muted", "filter:")} ${t.fg("accent", this.#filter)}▏ ` : t.fg("dim", "type to filter ");
 		const lines = [pad(title, width - visibleWidth(filter)) + filter, t.fg("dim", "─".repeat(width))];
 
 		const textCols = width - THUMB_COLS - 5;
 		if (items.length === 0) {
-			const empty = this.#all.length === 0 ? "Nothing yet: artifacts the agent shows, and files you /view, land here." : "No match.";
+			const empty =
+				this.#all.length === 0
+					? "Nothing yet: artifacts the agent shows, and files you /view, land here."
+					: pool.length === 0
+						? `Nothing from this project yet; tab shows all ${this.#all.length}.`
+						: "No match.";
 			lines.push("", `  ${t.fg("muted", empty)}`);
 		}
 		for (let i = this.#top; i < Math.min(items.length, this.#top + this.#visible); i++) {
@@ -755,7 +771,7 @@ class ArtifactLibrary implements Component {
 		while (lines.length < rows - LIB_FOOTER_ROWS) lines.push("");
 		lines.length = rows - LIB_FOOTER_ROWS;
 		lines.push(t.fg("dim", "─".repeat(width)));
-		const help = "↑↓ wheel move · enter click open · del forget · ctrl+o browser · esc close";
+		const help = `tab ${this.#allProjects ? "this project" : "all projects"} · ↑↓ wheel move · enter click open · del forget · ctrl+o browser · esc close`;
 		const status = this.#status ? `${t.fg("warning", this.#status)}  ` : "";
 		lines.push(truncateToWidth(` ${status}${t.fg("dim", help)}`, width));
 		return lines;
@@ -792,6 +808,9 @@ class ArtifactLibrary implements Component {
 				return this.#move(-Number.MAX_SAFE_INTEGER);
 			case "end":
 				return this.#move(Number.MAX_SAFE_INTEGER);
+			case "tab":
+				this.#allProjects = !this.#allProjects;
+				return this.#setFilter(this.#filter);
 			case "enter":
 			case "return":
 				return this.#open();
@@ -824,11 +843,19 @@ class ArtifactLibrary implements Component {
 		if (deletes) this.#tui.terminal.write(deletes);
 	}
 
+	/** Entries of the current scope, before the text filter. */
+	#pool(): LibraryEntry[] {
+		return this.#allProjects ? this.#all : this.#all.filter(e => e.cwd === this.#cwd);
+	}
+
 	#items(): LibraryEntry[] {
+		const pool = this.#pool();
 		const needle = this.#filter.toLowerCase();
-		if (!needle) return this.#all;
-		return this.#all.filter(e =>
-			`${e.label}\n${e.source}\n${KIND_LABEL[e.kind]}${isQueued(e.source) ? "\nqueued" : ""}`.toLowerCase().includes(needle),
+		if (!needle) return pool;
+		return pool.filter(e =>
+			`${e.label}\n${e.source}\n${e.cwd}\n${KIND_LABEL[e.kind]}${isQueued(e.source) ? "\nqueued" : ""}`
+				.toLowerCase()
+				.includes(needle),
 		);
 	}
 
@@ -915,7 +942,7 @@ async function openLibrary(ctx: ExtensionContext): Promise<void> {
 	let library: ArtifactLibrary | undefined;
 	await ctx.ui.custom<void>(
 		(tui, theme, _keybindings, done) => {
-			library = new ArtifactLibrary(tui, theme, () => done());
+			library = new ArtifactLibrary(tui, theme, () => done(), ctx.cwd);
 			return library;
 		},
 		{ overlay: true, overlayOptions: FULLSCREEN, onHandle: handle => library?.setHandle(handle) },
@@ -926,6 +953,7 @@ async function openLibrary(ctx: ExtensionContext): Promise<void> {
 
 export default function htmlView(pi: ExtensionAPI): void {
 	const z = pi.zod;
+	void sweepCache().catch(() => {});
 	let lastWritten: string | undefined;
 
 	pi.on("session_start", (_event, ctx) => {

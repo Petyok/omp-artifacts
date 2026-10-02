@@ -68,6 +68,29 @@ describe("pageUrl", () => {
 	});
 });
 
+describe("sweepCache", () => {
+	test("deletes entries unused for 30 days, a PDF folder as a whole; reuse keeps one", async () => {
+		setSystemTime();
+		const cache = path.join(root, "cache", "omp-artifacts");
+		const make = (rel: string) => {
+			const p = path.join(cache, rel);
+			fs.mkdirSync(path.dirname(p), { recursive: true });
+			fs.writeFileSync(p, "x");
+			return p;
+		};
+		const old = new Date(Date.now() - 31 * 24 * 60 * 60_000);
+		const oldThumb = make("thumbs/old.png");
+		const freshThumb = make("thumbs/fresh.png");
+		const reusedThumb = make("thumbs/reused.png");
+		make("render/old-pdf/p-1.png");
+		const oldPdf = path.join(cache, "render/old-pdf");
+		for (const p of [oldThumb, reusedThumb, oldPdf]) fs.utimesSync(p, old, old);
+		A.touchCache(reusedThumb);
+		await A.sweepCache();
+		expect([oldThumb, oldPdf, freshThumb, reusedThumb].map(p => fs.existsSync(p))).toEqual([false, false, true, true]);
+	});
+});
+
 describe("library", () => {
 	const target = (f: string) => {
 		const t = A.resolveTarget(f, files);

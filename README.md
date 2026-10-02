@@ -1,5 +1,8 @@
 # omp-artifacts
 
+[![npm downloads](https://img.shields.io/npm/d18m/omp-artifacts?label=npm%20downloads)](https://www.npmjs.com/package/omp-artifacts)
+[![git clones](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/Petyok/omp-artifacts/badges/clones.json)](https://github.com/Petyok/omp-artifacts)
+
 Artifacts inside [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp`). The agent hands you a report, a
 plan or a mockup; a card appears above the prompt; you read it right in the terminal, scrolling with the
 mouse wheel. Everything you were shown stays in a searchable library.

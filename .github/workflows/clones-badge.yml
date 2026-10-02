@@ -1,0 +1,42 @@
+# Keeps the README's "git clones" badge. GitHub reports clones for the last 14 days only, so a nightly
+# run merges them by date into history.json on the `badges` branch and writes clones.json for
+# shields.io. Reading traffic needs a fine-grained token with "Administration: read" on this repo,
+# stored as the TRAFFIC_TOKEN secret; the workflow's own token only writes the two files.
+name: Clones badge
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      # No checkout on purpose: cloning the repo here would add a clone to the count every night.
+      - name: Merge the last 14 days into the history
+        env:
+          TRAFFIC_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TRAFFIC_TOKEN" ]; then echo "::warning::TRAFFIC_TOKEN is not set; badge not updated"; exit 0; fi
+          GH_TOKEN="$TRAFFIC_TOKEN" gh api "repos/$REPO/traffic/clones" > new.json
+          gh api "repos/$REPO/contents/history.json?ref=badges" > old.json
+          jq -r .content old.json | base64 -d > history.json
+          jq -S -s '.[0] + ([.[1].clones[] | {(.timestamp[0:10]): .count}] | add // {})' history.json new.json > merged.json
+          if jq -e -s '.[0] == .[1]' history.json merged.json > /dev/null; then echo "no new clones"; exit 0; fi
+          total=$(jq '[.[]] | add // 0' merged.json)
+          jq -n --arg m "$total" '{schemaVersion: 1, label: "git clones", message: $m, color: "blue"}' > clones.json
+          put() {
+            sha=$(gh api "repos/$REPO/contents/$1?ref=badges" -q .sha)
+            gh api -X PUT "repos/$REPO/contents/$1" -f branch=badges -f sha="$sha" \
+              -f message="badge: $total clones" -f content="$(base64 -w0 "$2")" > /dev/null
+          }
+          put history.json merged.json
+          put clones.json clones.json
+          echo "total clones: $total"

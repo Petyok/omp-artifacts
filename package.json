@@ -1,0 +1,39 @@
+{
+  "name": "omp-artifacts",
+  "version": "0.1.0",
+  "description": "Artifacts inside oh-my-pi (omp): the agent queues HTML, Markdown, code, images and PDFs; you read them in the terminal with kitty graphics.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Petr Netupskii",
+  "homepage": "https://github.com/Petyok/omp-artifacts#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Petyok/omp-artifacts.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Petyok/omp-artifacts/issues"
+  },
+  "keywords": [
+    "omp",
+    "oh-my-pi",
+    "omp-extension",
+    "pi-package",
+    "kitty",
+    "artifacts",
+    "preview",
+    "terminal"
+  ],
+  "omp": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "bun test"
+  }
+}

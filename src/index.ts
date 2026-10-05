@@ -970,6 +970,14 @@ export default function htmlView(pi: ExtensionAPI): void {
 		refreshCard();
 	});
 
+	// /vibe narrows the director to read, todo and the vibe_* worker tools, and that list has no
+	// room for extension tools; put show_artifact back before each turn. Leaving vibe restores the
+	// toolset saved on entry, which already had it.
+	pi.on("before_agent_start", async () => {
+		const active = pi.getActiveTools();
+		if (active.includes("vibe_spawn") && !active.includes("show_artifact")) await pi.setActiveTools([...active, "show_artifact"]);
+	});
+
 	pi.on("tool_result", (event, ctx) => {
 		if ((event.toolName !== "write" && event.toolName !== "edit") || event.isError) return undefined;
 		const p = event.input.path;

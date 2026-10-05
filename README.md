@@ -10,7 +10,8 @@ mouse wheel. Everything you were shown stays in a searchable library.
 ![The agent queued five files; the card above the prompt shows the newest](docs/queue.webp)
 
 - **Preview queue.** The agent calls `show_artifact`. A card with a thumbnail shows the newest item;
-  more items stack behind it (`1 of 5`). `alt+o`, or a click on the card title, opens it.
+  more items stack behind it (`1 of 5`). `alt+o`, or a click on the card title, opens it; `alt+x`
+  dismisses it unopened.
 - **Viewer.** A full-screen, scrollable render of the page, made by omp's own headless Chromium and drawn with
   kitty graphics. `m` switches to a 390 px phone layout.
 - **Artifact Library.** `alt+shift+o` lists everything shown or viewed in this project, with
@@ -55,6 +56,7 @@ to it and tells it to point you at the queue instead of describing how to open a
 | Key or command | What it does |
 |---|---|
 | `alt+o`, click on the card title | open the newest queued artifact; closing the viewer removes it from the queue |
+| `alt+x` | dismiss the newest queued artifact without opening it; it stays in the library |
 | `alt+shift+o`, `/artifacts` | open the Artifact Library |
 | `/view <file or URL>` | view any file; paths are relative to the session folder, `~` works |
 | `/view` | the newest queued artifact, else the last `.html`/`.md` the agent wrote |

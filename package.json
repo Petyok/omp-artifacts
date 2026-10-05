@@ -1,6 +1,6 @@
 {
   "name": "omp-artifacts",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Artifacts inside oh-my-pi (omp): the agent queues HTML, Markdown, code, images and PDFs; you read them in the terminal with kitty graphics.",
   "type": "module",
   "license": "MIT",

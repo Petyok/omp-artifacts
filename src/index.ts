@@ -5,6 +5,7 @@
  *                              above the prompt, right-aligned
  *   alt+o, or a click on the   opens the newest card's artifact; closing the viewer
  *   card's title               takes it off the queue
+ *   alt+x                      dismisses the newest card unopened; it stays in the library
  *   alt+shift+o, /artifacts    the Artifact Library: everything ever shown or viewed
  *   /view                      the queue head, else the last .html/.md written this session
  *   /view <path | URL>         any file (relative to the session cwd, ~ allowed)
@@ -89,12 +90,13 @@ const PREWARM_RE = /\.(html?|md|markdown)$/i;
 /** Opens the queue head; unbound in omp's default keymap. */
 const SHORTCUT = "alt+o";
 const LIBRARY_SHORTCUT = "alt+shift+o";
+const DISMISS_SHORTCUT = "alt+x";
 const CARD_WIDGET = "omp-artifacts-card";
 /** Target of the card's OSC 8 link; kitty's open-actions.conf turns a click into SHORTCUT. */
 const CARD_LINK = "omp-artifacts://open";
 const THUMB_COLS = 14;
 const THUMB_ROWS = 3;
-const CARD_TEXT_COLS = 36;
+const CARD_TEXT_COLS = 48;
 
 const FULLSCREEN: OverlayOptions = { fullscreen: true, mouseTracking: true, width: "100%", maxHeight: "100%", row: 0, col: 0 };
 
@@ -587,13 +589,13 @@ async function viewAndRecord(ctx: ExtensionContext, target: Target): Promise<voi
  * grows with the queue: further items only show as up to two card edges peeking
  * out above it, plus "1 of N". The library lists and tags every queued item.
  *
- *       ╭───────────────────────────────────────────────╮
- *     ╭─┴───────────────────────────────────────────────┴─╮
- *   ╭─┴──────────────┬────────────────────────────────────┴─╮
- *   │ [thumbnail]    │ Quarterly report              1 of 3 │
- *   │                │ HTML · 217 KB · just now             │
- *   │                │ alt+o open · alt+shift+o library     │
- *   ╰────────────────┴──────────────────────────────────────╯
+ *       ╭───────────────────────────────────────────────────────────╮
+ *     ╭─┴───────────────────────────────────────────────────────────┴─╮
+ *   ╭─┴──────────────┬────────────────────────────────────────────────┴─╮
+ *   │ [thumbnail]    │ Quarterly report                          1 of 3 │
+ *   │                │ HTML · 217 KB · just now                         │
+ *   │                │ alt+o open · alt+x dismiss · alt+shift+o library │
+ *   ╰────────────────┴──────────────────────────────────────────────────╯
  */
 class QueueCard implements Component {
 	#tui: TUI;
@@ -625,7 +627,10 @@ class QueueCard implements Component {
 		const text = [
 			pad(title, CARD_TEXT_COLS - visibleWidth(position)) + position,
 			fit(t.fg("muted", `${KIND_LABEL[head.kind]}${size} · ${ago(Date.now() - head.addedAt)}`), CARD_TEXT_COLS),
-			fit(`${t.fg("accent", SHORTCUT)} ${t.fg("muted", "open")} ${t.fg("dim", `· ${LIBRARY_SHORTCUT} library`)}`, CARD_TEXT_COLS),
+			fit(
+				`${t.fg("accent", SHORTCUT)} ${t.fg("muted", "open")} ${t.fg("dim", `· ${DISMISS_SHORTCUT} dismiss · ${LIBRARY_SHORTCUT} library`)}`,
+				CARD_TEXT_COLS,
+			),
 		];
 		const thumb = head.thumb?.grid ?? thumbPlaceholder(t, head.thumbState === "failed" ? "no preview" : "rendering…");
 		const bar = (s: string) => t.fg("dim", s);
@@ -1017,6 +1022,13 @@ export default function htmlView(pi: ExtensionAPI): void {
 			const head = queue[0];
 			if (head) await viewAndRecord(ctx, head);
 			else ctx.ui.notify(`the preview queue is empty (${LIBRARY_SHORTCUT} opens the library)`, "info");
+		},
+	});
+
+	pi.registerShortcut(DISMISS_SHORTCUT, {
+		description: "Dismiss the newest artifact in the preview queue without opening it",
+		handler: () => {
+			if (queue[0]) dequeue(queue[0].source);
 		},
 	});
 

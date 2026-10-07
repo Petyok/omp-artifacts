@@ -15,6 +15,31 @@ import { ensureSharedBrowser } from "@oh-my-pi/pi-coding-agent/tools/browser/sha
 
 const CALL_TIMEOUT_MS = 30_000;
 const LOAD_TIMEOUT_MS = 20_000;
+/** Cap on waiting for network idle after `load`: long-poll, websocket and analytics pages never go idle. */
+const IDLE_TIMEOUT_MS = 5_000;
+
+/**
+ * Resolves after the DOM has not changed for 300 ms (at most 2 s), then after web
+ * fonts settle, with the page height in CSS px: data fetched after `load` is often
+ * rendered a few tasks later, and the last strip must not be cut short.
+ */
+const SETTLED_HEIGHT = `new Promise(resolve => {
+	let quiet;
+	const done = () => { observer.disconnect(); clearTimeout(quiet); clearTimeout(cap); resolve(); };
+	const observer = new MutationObserver(() => { clearTimeout(quiet); quiet = setTimeout(done, 300); });
+	observer.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+	quiet = setTimeout(done, 300);
+	const cap = setTimeout(done, 2000);
+})
+	.then(() => document.fonts.ready)
+	.then(() => Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0))`;
+
+/** True when `promise` settles first, false after `ms`. */
+function within(promise: Promise<unknown>, ms: number): Promise<boolean> {
+	const timeout = Promise.withResolvers<boolean>();
+	const timer = setTimeout(timeout.resolve, ms, false);
+	return Promise.race([promise.then(() => true), timeout.promise]).finally(() => clearTimeout(timer));
+}
 
 export interface Viewport {
 	/** CSS px. */
@@ -52,7 +77,10 @@ function field(result: CdpResult, key: string): string {
 
 /** One browser tab: load a page at a viewport, capture slices of it. */
 export interface RendererPage {
-	/** Navigates (or reloads) `url` at `viewport`; resolves with the page height in CSS px. */
+	/**
+	 * Navigates (or reloads) `url` at `viewport` and waits for `load`, network idle (≤5 s)
+	 * and a quiet DOM (≤2 s); resolves with the page height in CSS px.
+	 */
 	load(url: string, viewport: Viewport): Promise<number>;
 	/**
 	 * PNG (base64) of the CSS-px rectangle starting at `y`, at the viewport's device
@@ -67,7 +95,7 @@ export class HtmlRenderer {
 	#contextId = "";
 	#nextId = 1;
 	#pending = new Map<number, Pending>();
-	#listeners = new Set<(method: string, sessionId?: string) => void>();
+	#listeners = new Set<(method: string, sessionId: string | undefined, params: CdpResult) => void>();
 	#closed = false;
 
 	private constructor(ws: WebSocket) {
@@ -82,7 +110,7 @@ export class HtmlRenderer {
 				if (msg.error) p.reject(new Error(`${msg.error.message} (${msg.error.code})`));
 				else p.resolve(msg.result ?? {});
 			} else if (msg.method) {
-				for (const listener of this.#listeners) listener(msg.method, msg.sessionId);
+				for (const listener of this.#listeners) listener(msg.method, msg.sessionId, (msg.params ?? {}) as CdpResult);
 			}
 		};
 		ws.onclose = () => {
@@ -122,25 +150,38 @@ export class HtmlRenderer {
 		const sessionId = field(await this.#call("Target.attachToTarget", { targetId, flatten: true }), "sessionId");
 		const call = (method: string, params: Record<string, unknown> = {}) => this.#call(method, params, sessionId);
 		await call("Page.enable");
+		await call("Page.setLifecycleEventsEnabled", { enabled: true });
 		return {
 			load: async (url, viewport) => {
 				await call("Emulation.setDeviceMetricsOverride", { ...viewport });
-				const loaded = this.#waitFor("Page.loadEventFired", sessionId, LOAD_TIMEOUT_MS);
+				// Both listen from before the navigation; idle matches only this navigation's document.
+				let nav: CdpResult = {};
+				const loaded = this.#waitFor("Page.loadEventFired", sessionId);
+				// Chrome's networkIdle: no requests for 500 ms (Puppeteer's networkidle0), so fetch/XHR
+				// started after `load` have landed.
+				const idle = this.#waitFor(
+					"Page.lifecycleEvent",
+					sessionId,
+					p => p.name === "networkIdle" && p.frameId === nav.frameId && p.loaderId === nav.loaderId,
+				);
 				try {
-					const nav = await call("Page.navigate", { url });
+					nav = await call("Page.navigate", { url });
 					if (typeof nav.errorText === "string" && nav.errorText) throw new Error(`${url}: ${nav.errorText}`);
-				} catch (err) {
+					if (!(await within(loaded.promise, LOAD_TIMEOUT_MS))) {
+						throw new Error(`Page.loadEventFired not fired within ${LOAD_TIMEOUT_MS} ms`);
+					}
+					// Blink checks for network idle only when a main-thread task starts, else on a 2 s
+					// watchdog (idleness_detector.cc): on a static page that put idle at load + ~950 ms.
+					// A no-op tick brings it to the 500 ms window; it stops by itself.
+					await call("Runtime.evaluate", {
+						expression: `{ const tick = setInterval(() => {}, 100); setTimeout(clearInterval, ${IDLE_TIMEOUT_MS}, tick); }`,
+					});
+					await within(idle.promise, IDLE_TIMEOUT_MS);
+				} finally {
 					loaded.cancel();
-					throw err;
+					idle.cancel();
 				}
-				await loaded.promise;
-				// Height after web fonts settle, so the last strip is not cut short.
-				const { result } = await call("Runtime.evaluate", {
-					expression:
-						"document.fonts.ready.then(() => Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0))",
-					awaitPromise: true,
-					returnByValue: true,
-				});
+				const { result } = await call("Runtime.evaluate", { expression: SETTLED_HEIGHT, awaitPromise: true, returnByValue: true });
 				const value = result && typeof result === "object" && "value" in result ? Number(result.value) : Number.NaN;
 				return Number.isFinite(value) && value > 0 ? Math.ceil(value) : 1;
 			},
@@ -174,24 +215,20 @@ export class HtmlRenderer {
 		return promise;
 	}
 
-	#waitFor(event: string, sessionId: string, timeoutMs: number): { promise: Promise<void>; cancel: () => void } {
-		const { promise, resolve, reject } = Promise.withResolvers<void>();
-		const listener = (method: string, from?: string) => {
-			if (method !== event || from !== sessionId) return;
+	/** Resolves on the first `event` of `sessionId` whose params pass `match`; never times out, callers bound it. */
+	#waitFor(
+		event: string,
+		sessionId: string,
+		match: (params: CdpResult) => boolean = () => true,
+	): { promise: Promise<void>; cancel: () => void } {
+		const { promise, resolve } = Promise.withResolvers<void>();
+		const listener = (method: string, from: string | undefined, params: CdpResult) => {
+			if (method !== event || from !== sessionId || !match(params)) return;
 			this.#listeners.delete(listener);
-			clearTimeout(timer);
 			resolve();
 		};
-		const timer = setTimeout(() => {
-			this.#listeners.delete(listener);
-			reject(new Error(`${event} not fired within ${timeoutMs} ms`));
-		}, timeoutMs);
 		this.#listeners.add(listener);
-		const cancel = () => {
-			this.#listeners.delete(listener);
-			clearTimeout(timer);
-		};
-		return { promise, cancel };
+		return { promise, cancel: () => this.#listeners.delete(listener) };
 	}
 
 	#failAll(err: Error): void {

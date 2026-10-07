@@ -99,6 +99,9 @@ Everything but HTML and URLs gets a small header with the file name, folder, siz
   sized to your terminal in pixels. omp starts and stops that browser; the plugin only connects, as soon as
   the agent writes an `.html` or `.md`. Its tabs sit in a browser context of their own that Chromium
   disposes when the connection drops, so a crashed omp leaves no tabs behind.
+- Before the first capture it waits for the page's `load` event, then for the network to stay quiet for
+  500 ms (at most 5 s) and the DOM for 300 ms (at most 2 s), so pages that fetch their data after loading
+  show the data, not a loading skeleton.
 - The page is captured in screen-tall strips. Each strip is sent to kitty once and drawn through Unicode
   placeholders, where every cell names its own image row, so scrolling only reprints text. At most five
   strips stay in kitty's memory.
@@ -106,8 +109,8 @@ Everything but HTML and URLs gets a small header with the file name, folder, siz
   windows. Each entry remembers the folder its omp session ran in; that folder is "this project", the
   same way omp scopes its sessions. It keeps the 500 most recently shown entries across all projects;
   older ones drop off the list, the files stay. Rendered pages and thumbnails are cached in
-  `~/.cache/omp-artifacts`; anything there unused for 30 days is deleted when omp starts and rebuilt
-  on the next view.
+  `~/.cache/omp-artifacts`; URL thumbnails are rendered again after 10 minutes, and anything unused for
+  30 days is deleted when omp starts and rebuilt on the next view.
 
 ## Limits
 
@@ -115,6 +118,7 @@ Everything but HTML and URLs gets a small header with the file name, folder, siz
   `o` opens the real page in a browser.
 - kitty-style graphics only; other terminals get an error message instead of a broken screen.
 - The queue lives in memory and is empty after an omp restart; the library keeps everything.
+- URLs load without your browser's cookies: a page behind a login shows the login page.
 - Mermaid blocks in Markdown are shown as code.
 
 ## Develop

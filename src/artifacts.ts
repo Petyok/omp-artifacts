@@ -35,6 +35,7 @@ const PDF_MAX_PAGES = 60;
 const PDF_DPI = 110;
 /** Cache entries unused this long are deleted at startup; the next view rebuilds them. */
 const CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
+export const URL_THUMB_TTL_MS = 10 * 60_000;
 
 const KIND_BY_EXT: Record<string, Kind> = {
 	html: "html",
@@ -224,9 +225,12 @@ export async function pageUrl(target: Target): Promise<string> {
 	return pathToFileURL(out).href;
 }
 
-/** Where a rendered thumbnail of `target` at this pixel size is cached; changes when the file does. */
+/**
+ * Where a rendered thumbnail of `target` at this pixel size is cached; changes when the
+ * file does, and for URLs every {@link URL_THUMB_TTL_MS}, since a page can change any time.
+ */
 export function thumbCachePath(target: Target, widthPx: number, heightPx: number): string {
-	const version = fileInfo(target)?.mtimeMs ?? 0;
+	const version = target.kind === "url" ? Math.floor(Date.now() / URL_THUMB_TTL_MS) : (fileInfo(target)?.mtimeMs ?? 0);
 	return path.join(CACHE_DIR, "thumbs", `${hash(`${target.source}|${version}|${widthPx}x${heightPx}`)}.png`);
 }
 

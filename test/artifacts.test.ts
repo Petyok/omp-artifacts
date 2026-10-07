@@ -91,6 +91,23 @@ describe("sweepCache", () => {
 	});
 });
 
+describe("thumbCachePath", () => {
+	test("a URL thumbnail expires with its time bucket; a file one only when the file changes", () => {
+		const url = A.resolveTarget("https://example.com/", files) as A.Target;
+		const file = A.resolveTarget("page.html", files) as A.Target;
+		const at = (ms: number, t: A.Target) => {
+			setSystemTime(new Date(ms));
+			return A.thumbCachePath(t, 140, 60);
+		};
+		const start = Date.UTC(2026, 9, 7, 12, 0);
+		const later = start + A.URL_THUMB_TTL_MS;
+		expect(at(later - 1, url)).toBe(at(start, url));
+		expect(at(later, url)).not.toBe(at(start, url));
+		expect(at(later, file)).toBe(at(start, file));
+		setSystemTime();
+	});
+});
+
 describe("library", () => {
 	const target = (f: string) => {
 		const t = A.resolveTarget(f, files);

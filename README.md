@@ -38,10 +38,14 @@ Restart omp. Requirements:
 
 ### Clicking the card
 
-The card title is a terminal hyperlink to `omp-artifacts://open`. To make a click open it, tell kitty to
-press the shortcut when such a link is clicked. Add to `~/.config/kitty/open-actions.conf`:
+The card title is a terminal hyperlink to `omp-artifacts://open`, and its "dismiss all" button (shown when
+two or more are queued) one to `omp-artifacts://dismiss-all`. To make a click work, tell kitty to press the
+matching shortcut. Add to `~/.config/kitty/open-actions.conf`, in this order (the first match wins):
 
 ```conf
+url ^omp-artifacts://dismiss-all
+action send_key alt+shift+x
+
 protocol omp-artifacts
 action send_key alt+o
 ```
@@ -57,6 +61,7 @@ to it and tells it to point you at the queue instead of describing how to open a
 |---|---|
 | `alt+o`, click on the card title | open the newest queued artifact; closing the viewer removes it from the queue |
 | `alt+x` | dismiss the newest queued artifact without opening it; it stays in the library |
+| `alt+shift+x`, click on "dismiss all" | dismiss the whole queue; everything stays in the library |
 | `alt+shift+o`, `/artifacts` | open the Artifact Library |
 | `/view <file or URL>` | view any file; paths are relative to the session folder, `~` works |
 | `/view` | the newest queued artifact, else the last `.html`/`.md` the agent wrote |
@@ -75,7 +80,8 @@ In the viewer:
 
 In the library: `Tab` switches between this project and all projects, type to filter (try `queued`, or a
 project folder), `↑` `↓` or the wheel to move, `Enter` or a click to open, `ctrl+d` (or `Del`) to forget an
-entry (the file stays), `ctrl+o` to open in the browser, `Esc` to close.
+entry (the file stays; it asks first, and "yes, and don't ask again" stops asking until the next session),
+`ctrl+o` to open in the browser, `Esc` to close.
 
 ![Markdown in the viewer](docs/viewer-markdown.webp)
 

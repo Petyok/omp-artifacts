@@ -6,6 +6,8 @@
  *   alt+o, or a click on the   opens the newest card's artifact; closing the viewer
  *   card's title               takes it off the queue
  *   alt+x                      dismisses the newest card unopened; it stays in the library
+ *   alt+shift+x, or a click    dismisses the whole queue; the card shows that button
+ *   on its "dismiss all"       when 2+ are queued
  *   alt+shift+o, /artifacts    the Artifact Library: everything ever shown or viewed
  *   /view                      the queue head, else the last .html/.md written this session
  *   /view <path | URL>         any file (relative to the session cwd, ~ allowed)
@@ -21,10 +23,12 @@
  * Viewer keys: wheel / j k ↓↑ scroll · space b PgDn PgUp page · g G top/bottom ·
  * m desktop/mobile (390 px) · r reload from disk · o system browser · q Esc close.
  *
- * The card title is an OSC 8 link `omp-artifacts://open`; kitty maps a click on it to the
- * shortcut in ~/.config/kitty/open-actions.conf (`protocol omp-artifacts` /
- * `action send_key alt+o`). Only the title is a link: kitty underlines a hovered link
- * on every cell it covers, which across the whole card looked like static.
+ * The card title is an OSC 8 link `omp-artifacts://open`, its "dismiss all" button one to
+ * `omp-artifacts://dismiss-all`; kitty maps a click on them to the shortcuts in
+ * ~/.config/kitty/open-actions.conf (`url ^omp-artifacts://dismiss-all` / `action send_key
+ * alt+shift+x`, then `protocol omp-artifacts` / `action send_key alt+o`). Only those labels are
+ * links: kitty underlines a hovered link on every cell it covers, which across the whole card
+ * looked like static.
  *
  * Needs kitty (or Ghostty) graphics with Unicode placeholders. Pages render in omp's
  * own project-shared headless Chromium (render.ts); writing an .html or .md connects
@@ -49,6 +53,7 @@ import {
 	type OverlayOptions,
 	parseKey,
 	routeSgrMouseInput,
+	sliceByColumn,
 	TERMINAL,
 	type TUI,
 	truncateToWidth,
@@ -91,9 +96,11 @@ const PREWARM_RE = /\.(html?|md|markdown)$/i;
 const SHORTCUT = "alt+o";
 const LIBRARY_SHORTCUT = "alt+shift+o";
 const DISMISS_SHORTCUT = "alt+x";
+const DISMISS_ALL_SHORTCUT = "alt+shift+x";
 const CARD_WIDGET = "omp-artifacts-card";
-/** Target of the card's OSC 8 link; kitty's open-actions.conf turns a click into SHORTCUT. */
+/** Targets of the card's OSC 8 links; kitty's open-actions.conf turns a click into SHORTCUT or DISMISS_ALL_SHORTCUT. */
 const CARD_LINK = "omp-artifacts://open";
+const DISMISS_ALL_LINK = "omp-artifacts://dismiss-all";
 const THUMB_COLS = 14;
 const THUMB_ROWS = 3;
 const CARD_TEXT_COLS = 48;
@@ -113,7 +120,7 @@ function ago(ms: number): string {
 /** Pads an already-fitting styled string to `cols` cells. */
 const pad = (styled: string, cols: number): string => styled + " ".repeat(Math.max(0, cols - visibleWidth(styled)));
 const fit = (styled: string, cols: number): string => pad(truncateToWidth(styled, cols), cols);
-const link = (s: string): string => `\x1b]8;;${CARD_LINK}\x1b\\${s}\x1b]8;;\x1b\\`;
+const link = (s: string, url = CARD_LINK): string => `\x1b]8;;${url}\x1b\\${s}\x1b]8;;\x1b\\`;
 
 function openExternally(url: string): void {
 	Bun.spawn([process.platform === "darwin" ? "open" : "xdg-open", url], { stdin: "ignore", stdout: "ignore", stderr: "ignore" }).unref();
@@ -570,6 +577,11 @@ function dequeue(source: string): void {
 	refreshCard();
 }
 
+function dismissAll(): void {
+	for (const item of queue.splice(0)) dropCardThumb(item);
+	refreshCard();
+}
+
 const isQueued = (source: string): boolean => queue.some(q => q.source === source);
 
 function dropCardThumb(item: Queued): void {
@@ -595,7 +607,7 @@ async function viewAndRecord(ctx: ExtensionContext, target: Target): Promise<voi
  *   │ [thumbnail]    │ Quarterly report                          1 of 3 │
  *   │                │ HTML · 217 KB · just now                         │
  *   │                │ alt+o open · alt+x dismiss · alt+shift+o library │
- *   ╰────────────────┴──────────────────────────────────────────────────╯
+ *   ╰────────────────┴─────────────────┤ dismiss all · alt+shift+x ├───╯
  */
 class QueueCard implements Component {
 	#tui: TUI;
@@ -649,7 +661,13 @@ class QueueCard implements Component {
 		if (behind > 0) lines.push(left + bar(edge(2, behind === 2 ? 4 : undefined)));
 		lines.push(left + bar(front.join("")));
 		for (let r = 0; r < THUMB_ROWS; r++) lines.push(`${left}${bar("│")} ${thumb[r]} ${bar("│")} ${text[r]} ${bar("│")}`);
-		lines.push(left + bar(`╰${"─".repeat(THUMB_COLS + 2)}┴${"─".repeat(CARD_TEXT_COLS + 2)}╯`));
+		const bottom = `╰${"─".repeat(THUMB_COLS + 2)}┴`;
+		if (queue.length < 2) lines.push(left + bar(`${bottom}${"─".repeat(CARD_TEXT_COLS + 2)}╯`));
+		else {
+			const button = `${bar("┤")} ${link(t.fg("accent", "dismiss all"), DISMISS_ALL_LINK)} ${t.fg("dim", `· ${DISMISS_ALL_SHORTCUT}`)} ${bar("├")}`;
+			const dashes = CARD_TEXT_COLS + 2 - visibleWidth(button) - 3;
+			lines.push(`${left}${bar(bottom + "─".repeat(dashes))}${button}${bar("───╯")}`);
+		}
 		return lines;
 	}
 
@@ -687,6 +705,42 @@ const LIB_HEADER_ROWS = 2;
 const LIB_FOOTER_ROWS = 2;
 const ITEM_ROWS = 4;
 
+/** Cleared by "yes, and don't ask again"; /new, resume and fork start another session, which asks again. */
+let askBeforeForget = true;
+
+const FORGET_DIALOG_COLS = 52;
+const FORGET_KEYS: Record<string, "yes" | "always" | "no"> = { y: "yes", a: "always", n: "no", escape: "no" };
+/** Column where the text of a library row starts: marker, space, thumbnail, two spaces. */
+const LIB_TEXT_COL = THUMB_COLS + 4;
+
+/**
+ * The box asking before an entry is forgotten. The library draws it into its own lines: a
+ * TUI overlay that is not fullscreen makes omp leave the alternate screen, and the
+ * library's thumbnails vanish while it is up.
+ */
+function forgetDialog(t: ViewerTheme, label: string): string[] {
+	const inner = FORGET_DIALOG_COLS - 4;
+	const row = (s: string) => `${t.fg("dim", "│")} ${fit(s, inner)} ${t.fg("dim", "│")}`;
+	const key = (k: string, what: string) => `${t.fg("accent", k)}  ${what}`;
+	return [
+		t.fg("dim", `╭${"─".repeat(inner + 2)}╮`),
+		row(t.bold(`Forget ${truncateToWidth(label, inner - 8)}?`)),
+		row(t.fg("muted", "It leaves the library; the file stays.")),
+		row(""),
+		row(key("y", "yes")),
+		row(key("a", "yes, and don't ask again this session")),
+		row(key("n", `no ${t.fg("dim", "(esc)")}`)),
+		t.fg("dim", `╰${"─".repeat(inner + 2)}╯`),
+	];
+}
+
+/** `line` with `over` drawn from column `col`; `line` must not hold image cells. */
+function drawOver(line: string, over: string, col: number): string {
+	const end = col + visibleWidth(over);
+	const rest = sliceByColumn(line, end, Math.max(0, visibleWidth(line) - end), true);
+	return `${pad(sliceByColumn(line, 0, col, true), col)}\x1b[0m${over}\x1b[0m${rest}`;
+}
+
 /**
  * Fullscreen list of the artifacts shown or viewed in this project (the session's working
  * directory, as omp itself scopes projects), newest first; tab switches to all projects:
@@ -714,6 +768,8 @@ class ArtifactLibrary implements Component {
 	#infos = new Map<string, FileInfo | undefined>();
 	#thumbs = new Map<string, Placed | "loading" | "failed">();
 	#viewing = false;
+	/** The entry the forget dialog asks about, while it is up. */
+	#confirm?: LibraryEntry;
 	#status = "";
 	#disposed = false;
 
@@ -747,6 +803,8 @@ class ArtifactLibrary implements Component {
 		const lines = [pad(title, width - visibleWidth(filter)) + filter, t.fg("dim", "─".repeat(width))];
 
 		const textCols = width - THUMB_COLS - 5;
+		/** Rows holding thumbnail cells, split around them for the forget dialog. */
+		const thumbRows = new Map<number, { marker: string; prefix: string; text: string }>();
 		if (items.length === 0) {
 			const empty =
 				this.#all.length === 0
@@ -770,11 +828,27 @@ class ArtifactLibrary implements Component {
 			const tag = isQueued(e.source) ? t.fg("accent", "queued · ") : "";
 			const third = e.file && !info ? t.fg("error", `missing · ${e.file}`) : t.fg("dim", e.file ? path.basename(e.file) : e.source);
 			const text = [pad(head, textCols - visibleWidth(age)) + age, fit(tag + t.fg("muted", meta), textCols), fit(third, textCols)];
-			for (let r = 0; r < THUMB_ROWS; r++) lines.push(`${marker} ${thumb[r]}  ${text[r]}`);
+			for (let r = 0; r < THUMB_ROWS; r++) {
+				const prefix = `${marker} ${thumb[r]}  `;
+				thumbRows.set(lines.length, { marker, prefix, text: text[r] });
+				lines.push(prefix + text[r]);
+			}
 			lines.push("");
 		}
 		while (lines.length < rows - LIB_FOOTER_ROWS) lines.push("");
 		lines.length = rows - LIB_FOOTER_ROWS;
+		if (this.#confirm) {
+			const dialog = forgetDialog(t, this.#confirm.label);
+			const top = Math.max(0, Math.floor((lines.length - dialog.length) / 2));
+			const col = Math.max(0, Math.floor((width - FORGET_DIALOG_COLS) / 2));
+			for (let d = 0; d < dialog.length && top + d < lines.length; d++) {
+				const thumbRow = thumbRows.get(top + d);
+				// Image cells cannot be sliced: keep the thumbnail when the box is right of it, else blank it.
+				if (!thumbRow) lines[top + d] = drawOver(lines[top + d], dialog[d], col);
+				else if (col >= LIB_TEXT_COL) lines[top + d] = thumbRow.prefix + drawOver(thumbRow.text, dialog[d], col - LIB_TEXT_COL);
+				else lines[top + d] = drawOver(`${thumbRow.marker} ${" ".repeat(THUMB_COLS)}  ${thumbRow.text}`, dialog[d], col);
+			}
+		}
 		lines.push(t.fg("dim", "─".repeat(width)));
 		const help = `tab ${this.#allProjects ? "this project" : "all projects"} · ↑↓ wheel move · enter click open · ctrl+d forget · ctrl+o browser · esc close`;
 		const status = this.#status ? `${t.fg("warning", this.#status)}  ` : "";
@@ -784,6 +858,16 @@ class ArtifactLibrary implements Component {
 
 	handleInput(data: string): void {
 		if (this.#viewing) return;
+		if (this.#confirm) {
+			if (routeSgrMouseInput(data, () => true) || isKeyRelease(data)) return;
+			const answer = FORGET_KEYS[parseKey(data) ?? ""];
+			if (!answer) return;
+			const e = this.#confirm;
+			this.#confirm = undefined;
+			if (answer === "always") askBeforeForget = false;
+			if (answer === "no") return this.#tui.requestRender();
+			return this.#forgetNow(e);
+		}
 		const isMouse = routeSgrMouseInput(data, event => {
 			if (event.wheel) this.#move(event.wheel);
 			else if (event.leftClick) {
@@ -913,6 +997,12 @@ class ArtifactLibrary implements Component {
 	#forget(): void {
 		const e = this.#items()[this.#selected];
 		if (!e) return;
+		if (!askBeforeForget) return this.#forgetNow(e);
+		this.#confirm = e;
+		this.#tui.requestRender();
+	}
+
+	#forgetNow(e: LibraryEntry): void {
 		forgetInLibrary(e.source);
 		this.#all = this.#all.filter(x => x.source !== e.source);
 		this.#say(`forgot ${e.label} (the file stays)`);
@@ -968,6 +1058,10 @@ export default function htmlView(pi: ExtensionAPI): void {
 		mainUi = ctx.ui;
 		cardMounted = false;
 		refreshCard();
+	});
+
+	pi.on("session_switch", () => {
+		askBeforeForget = true;
 	});
 
 	// /vibe narrows the director to read, todo and the vibe_* worker tools, and that list has no
@@ -1038,6 +1132,11 @@ export default function htmlView(pi: ExtensionAPI): void {
 		handler: () => {
 			if (queue[0]) dequeue(queue[0].source);
 		},
+	});
+
+	pi.registerShortcut(DISMISS_ALL_SHORTCUT, {
+		description: "Dismiss every artifact in the preview queue; they stay in the library",
+		handler: dismissAll,
 	});
 
 	pi.registerShortcut(LIBRARY_SHORTCUT, {

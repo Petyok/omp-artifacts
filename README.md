@@ -26,7 +26,9 @@ mouse wheel. Everything you were shown stays in a searchable library.
 omp install omp-artifacts
 ```
 
-Restart omp. Requirements:
+Restart omp. When npm has a newer version, omp says so in a dim line at startup; the same
+`omp install omp-artifacts` and a restart upgrade it (`omp update --plugins` covers only marketplace
+plugins). Requirements:
 
 | | |
 |---|---|

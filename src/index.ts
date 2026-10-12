@@ -33,6 +33,8 @@
  * Needs kitty (or Ghostty) graphics with Unicode placeholders. Pages render in omp's
  * own project-shared headless Chromium (render.ts); writing an .html or .md connects
  * to it in the background so the first view does not wait.
+ *
+ * Once per omp start, a dim line in the chat says when npm has a newer omp-artifacts.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -77,6 +79,7 @@ import {
 	touchCache,
 } from "./artifacts.ts";
 import { HtmlRenderer, type RendererPage, type Viewport } from "./render.ts";
+import pkg from "../package.json" with { type: "json" };
 
 /** Desktop layouts are rendered at most this wide (CSS px); wider terminals get a higher device scale. */
 const DESKTOP_CSS_WIDTH = 1280;
@@ -1044,12 +1047,27 @@ async function openLibrary(ctx: ExtensionContext): Promise<void> {
 	);
 }
 
+/**
+ * omp checks only itself and marketplace plugins for updates; `omp install omp-artifacts` is what
+ * upgrades an npm plugin. Offline or a slow registry stays quiet.
+ */
+async function notifyIfOutdated(ui: ExtensionContext["ui"]): Promise<void> {
+	try {
+		const res = await fetch(`https://registry.npmjs.org/${pkg.name}/latest`, { signal: AbortSignal.timeout(5_000) });
+		const { version } = (await res.json()) as { version: string };
+		if (Bun.semver.order(version, pkg.version) > 0) {
+			ui.notify(`${pkg.name} ${version} is available (you have ${pkg.version}): omp install ${pkg.name}, then restart omp`, "info");
+		}
+	} catch {}
+}
+
 // ── wiring ──────────────────────────────────────────────────────────────────
 
 export default function htmlView(pi: ExtensionAPI): void {
 	const z = pi.zod;
 	void sweepCache().catch(() => {});
 	let lastWritten: string | undefined;
+	let updateChecked = false;
 
 	pi.on("session_start", (_event, ctx) => {
 		projectDir = ctx.cwd;
@@ -1058,6 +1076,10 @@ export default function htmlView(pi: ExtensionAPI): void {
 		mainUi = ctx.ui;
 		cardMounted = false;
 		refreshCard();
+		if (!updateChecked) {
+			updateChecked = true;
+			void notifyIfOutdated(ctx.ui);
+		}
 	});
 
 	pi.on("session_switch", () => {

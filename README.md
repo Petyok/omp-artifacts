@@ -90,7 +90,7 @@ entry (the file stays; it asks first, and "yes, and don't ask again" stops askin
 | Type | How it is shown |
 |---|---|
 | HTML, URLs | as they are |
-| Markdown | GFM through Bun's built-in renderer: tables, task lists, code, relative images |
+| Markdown | GFM through Bun's built-in renderer: tables, task lists, code, relative images; `mermaid` blocks drawn by mermaid.js (a block it cannot parse stays code) |
 | Text and code | numbered lines in a monospace font, cut at 2 MB; binary files are refused |
 | Images | png, jpg, gif, webp, avif, svg, bmp, ico, centred on a checkerboard |
 | PDF | the first 60 pages as images, through `pdftoppm` |
@@ -125,7 +125,6 @@ Everything but HTML and URLs gets a small header with the file name, folder, siz
 - kitty-style graphics only; other terminals get an error message instead of a broken screen.
 - The queue lives in memory and is empty after an omp restart; the library keeps everything.
 - URLs load without your browser's cookies: a page behind a login shows the login page.
-- Mermaid blocks in Markdown are shown as code.
 
 ## Develop
 
@@ -137,4 +136,5 @@ bun test
 
 ## License
 
-MIT
+MIT. `src/vendor/mermaid.min.js` is mermaid 12.1.0, MIT ([its license](src/vendor/mermaid.LICENSE)); the
+licenses of the libraries it bundles are at the end of that file.

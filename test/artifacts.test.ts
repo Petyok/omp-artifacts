@@ -18,6 +18,7 @@ beforeAll(() => {
 	fs.mkdirSync(files, { recursive: true });
 	put("page.html", "<!doctype html><title>x</title>");
 	put("notes.md", "# Title\n\n| a | b |\n|---|---|\n| 1 | 2 |\n");
+	put("flow.md", "```mermaid\nflowchart LR; A-->B\n```\n");
 	put("Makefile", "all:\n\techo <b>hi</b> <script>alert(1)</script>\n");
 	put("shot.png", new Uint8Array([0x89, 0x50, 0x4e, 0x47]));
 	put("doc.pdf", "%PDF-1.4");
@@ -65,6 +66,19 @@ describe("pageUrl", () => {
 		const html = fs.readFileSync(fileURLToPath(await A.pageUrl(t)), "utf8");
 		expect(html).toContain("<h1>Title</h1>");
 		expect(html).toContain("<table>");
+	});
+
+	test("mermaid fences become diagrams drawn by the vendored mermaid.js; other pages load no script", async () => {
+		const page = async (name: string) => {
+			const t = A.resolveTarget(name, files);
+			if (typeof t === "string") throw new Error(t);
+			return fs.readFileSync(fileURLToPath(await A.pageUrl(t)), "utf8");
+		};
+		const html = await page("flow.md");
+		expect(html).toContain('<div class="mermaid">flowchart LR; A--&gt;B\n</div>');
+		const src = html.match(/<script src="([^"]+)">/)?.[1];
+		expect(src && fs.existsSync(fileURLToPath(src))).toBe(true);
+		expect(await page("notes.md")).not.toContain("<script");
 	});
 });
 

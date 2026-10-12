@@ -3,10 +3,11 @@
  * Artifact Library. Used by index.ts.
  *
  * HTML and URLs load as they are. Everything else is wrapped into a generated
- * page under ~/.cache/omp-artifacts/render/: Markdown through Bun.markdown (GFM),
- * text/code as numbered lines, images centred on a checkerboard, PDFs as page
- * images from pdftoppm (poppler). Wrappers are rebuilt on every load, so a reload
- * in the viewer picks up edits.
+ * page under ~/.cache/omp-artifacts/render/: Markdown through Bun.markdown (GFM)
+ * with mermaid fences drawn in the page by the vendored mermaid.js, text/code
+ * as numbered lines, images centred on a checkerboard, PDFs as page images from
+ * pdftoppm (poppler). Wrappers are rebuilt on every load, so a reload in the
+ * viewer picks up edits.
  */
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
@@ -143,6 +144,8 @@ header b{color:var(--ink);font-weight:700}
 .md hr{border:0;border-top:1px solid var(--line);margin:2em 0}
 .md li.task-list-item{list-style:none}
 .md li.task-list-item input{margin:0 .5em 0 -1.4em}
+.md div.mermaid{margin:1.2em 0;text-align:center}
+.md div.mermaid:not(:has(svg)){white-space:pre-wrap;text-align:left;font:.85em/1.45 ui-monospace,Menlo,monospace;background:var(--code);padding:14px 16px;border-radius:4px}
 .txt pre{margin:0;padding:14px 0 40px;font:13px/1.55 ui-monospace,Menlo,monospace;tab-size:4;white-space:pre-wrap;word-break:break-word;counter-reset:l}
 .txt .l{display:block;position:relative;padding:0 24px 0 72px;min-height:1.55em}
 .txt .l::before{counter-increment:l;content:counter(l);position:absolute;left:0;width:52px;text-align:right;color:#b3aea3}
@@ -166,6 +169,19 @@ function wrapperPage(target: Target, cls: string, body: string, note = ""): stri
 <body class="${cls}"><header><span class="k">${KIND_LABEL[target.kind]}</span><b>${esc(path.basename(file))}</b>
 <span>${esc(tildify(path.dirname(file)))}</span><span>${esc(meta)}${esc(note)}</span></header><main>${body}</main></body></html>`;
 }
+
+/** A mermaid fence as Bun.markdown writes it; the page reads the HTML-escaped source back as `textContent`. */
+const MERMAID_FENCE = /<pre><code class="language-mermaid">([\s\S]*?)<\/code><\/pre>/g;
+/**
+ * mermaid 12.1.0's self-contained browser bundle (MIT, vendor/mermaid.LICENSE), run only by pages
+ * with a diagram. `mermaid.run` would empty a diagram it cannot parse; `render` leaves its source,
+ * styled as a code block by the CSS above.
+ */
+const MERMAID_RUN = `<script src="${esc(new URL("vendor/mermaid.min.js", import.meta.url).href)}"></script>
+<script>mermaid.initialize({startOnLoad:false,theme:"neutral",fontFamily:"system-ui,sans-serif",suppressErrorRendering:true});
+document.querySelectorAll("div.mermaid").forEach(async (el, i) => {
+	try { el.innerHTML = (await mermaid.render("mermaid-" + i, el.textContent)).svg } catch {}
+})</script>`;
 
 async function renderPdfPages(file: string, mtimeMs: number): Promise<string[]> {
 	const dir = path.join(CACHE_DIR, "render", `${hash(file)}-pdf`);
@@ -201,7 +217,9 @@ export async function pageUrl(target: Target): Promise<string> {
 	if (!info) throw new Error(`file is gone: ${file}`);
 	let html: string;
 	if (target.kind === "markdown") {
-		html = wrapperPage(target, "md", Bun.markdown.html(fs.readFileSync(file, "utf8")));
+		const md = Bun.markdown.html(fs.readFileSync(file, "utf8"));
+		const body = md.replace(MERMAID_FENCE, `<div class="mermaid">$1</div>`);
+		html = wrapperPage(target, "md", body === md ? md : body + MERMAID_RUN);
 	} else if (target.kind === "image") {
 		html = wrapperPage(target, "img", `<img src="${esc(pathToFileURL(file).href)}" alt="">`);
 	} else if (target.kind === "pdf") {

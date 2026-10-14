@@ -23,19 +23,23 @@ const IDLE_TIMEOUT_MS = 5_000;
  * fonts settle, with the page size in CSS px: data fetched after `load` is often
  * rendered a few tasks later, and the last strip must not be cut short.
  */
-const SETTLED_SIZE = `new Promise(resolve => {
+const settledSize = (quietMs: number, capMs: number): string => `new Promise(resolve => {
 	let quiet;
 	const done = () => { observer.disconnect(); clearTimeout(quiet); clearTimeout(cap); resolve(); };
-	const observer = new MutationObserver(() => { clearTimeout(quiet); quiet = setTimeout(done, 300); });
+	const observer = new MutationObserver(() => { clearTimeout(quiet); quiet = setTimeout(done, ${quietMs}); });
 	observer.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
-	quiet = setTimeout(done, 300);
-	const cap = setTimeout(done, 2000);
+	quiet = setTimeout(done, ${quietMs});
+	const cap = setTimeout(done, ${capMs});
 })
 	.then(() => document.fonts.ready)
 	.then(() => ({
 		width: Math.max(document.documentElement.scrollWidth, document.body ? document.body.scrollWidth : 0),
 		height: Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0),
 	}))`;
+/** After `load`: data fetched later may still be rendering. */
+const SETTLED_SIZE = settledSize(300, 2000);
+/** After a click: the page is already up, so only its reaction (a panel, an animation frame) is waited for. */
+const SETTLED_AFTER_CLICK = settledSize(100, 800);
 
 /** Page extent in CSS px; `width` beyond the viewport means the page scrolls sideways. */
 export interface PageSize {
@@ -224,7 +228,7 @@ export class HtmlRenderer {
 				await call("Input.dispatchMouseEvent", { type: "mousePressed", ...point, button: "left", clickCount: 1 });
 				await call("Input.dispatchMouseEvent", { type: "mouseReleased", ...point, button: "left", clickCount: 1 });
 				await evaluate("window.scrollTo(0, 0)");
-				const { result } = await call("Runtime.evaluate", { expression: SETTLED_SIZE, awaitPromise: true, returnByValue: true });
+				const { result } = await call("Runtime.evaluate", { expression: SETTLED_AFTER_CLICK, awaitPromise: true, returnByValue: true });
 				return toPageSize(result);
 			},
 			capture: async (x, y, width, height, scale = 1) => {

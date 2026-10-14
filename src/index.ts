@@ -160,6 +160,10 @@ interface Placed {
 interface Chunk extends Placed {
 	ty: number;
 	tx: number;
+	/** Columns the image spans; a tile captured before the page resized no longer fits and is not drawn. */
+	cols: number;
+	/** The page changed since this was captured: still drawn until its replacement arrives, and captured again. */
+	stale: boolean;
 }
 
 const chunkKey = (ty: number, tx: number): string => `${ty}:${tx}`;
@@ -306,9 +310,10 @@ class HtmlViewer implements Component {
 			const from = Math.max(this.#leftCol, base);
 			const to = Math.min(end, base + g.imageCols);
 			const chunk = this.#chunks.get(chunkKey(ty, tx));
-			if (!chunk) cells += " ".repeat(to - from);
-			else if (from === base && to - from === this.#tileCols(g, tx)) cells += chunk.grid[row % g.chunkRows];
-			else cells += sliceByColumn(chunk.grid[row % g.chunkRows], from - base, to - from);
+			const line = chunk && chunk.cols === this.#tileCols(g, tx) ? chunk.grid[row % g.chunkRows] : undefined;
+			if (line === undefined) cells += " ".repeat(to - from);
+			else if (from === base && to - from === chunk?.cols) cells += line;
+			else cells += sliceByColumn(line, from - base, to - from);
 		}
 		return cells;
 	}
@@ -452,10 +457,20 @@ class HtmlViewer implements Component {
 		this.#kick();
 	}
 
-	/** Throws the captured tiles away and fetches the visible ones again (the page changed). */
-	#redraw(): void {
-		this.#dropChunks();
+	/**
+	 * The page changed: every tile is captured again, visible ones first, but each keeps showing
+	 * until its replacement arrives, so a click updates the screen in place instead of blanking it.
+	 */
+	#refresh(g: Geometry): void {
 		this.#generation++;
+		const tilesY = Math.ceil(this.#pageRows / g.chunkRows);
+		const tilesX = Math.ceil(this.#pageCols / g.imageCols);
+		for (const [key, chunk] of this.#chunks) {
+			if (chunk.ty >= tilesY || chunk.tx >= tilesX) {
+				this.#chunks.delete(key);
+				this.#tui.terminal.write(encodeKittyDeleteImage(chunk.imageId));
+			} else chunk.stale = true;
+		}
 		this.#tui.requestRender();
 		this.#kick();
 	}
@@ -481,7 +496,7 @@ class HtmlViewer implements Component {
 				if (this.#disposed || this.#loadedKey !== key) return;
 				this.#status = "";
 				this.#applySize(size, g);
-				this.#redraw();
+				this.#refresh(g);
 			},
 			err => {
 				this.#clicking = false;
@@ -595,7 +610,9 @@ class HtmlViewer implements Component {
 		for (let ty = y0; ty <= y1; ty++) for (let tx = x0; tx <= x1; tx++) order.push([ty, tx]);
 		for (let ty = y0; ty <= y1; ty++) order.push([ty, x1 + 1], [ty, x0 - 1]);
 		for (let tx = x0; tx <= x1; tx++) order.push([y1 + 1, tx], [y0 - 1, tx]);
-		return order.find(([ty, tx]) => ty >= 0 && ty < tilesY && tx >= 0 && tx < tilesX && !this.#chunks.has(chunkKey(ty, tx)));
+		return order.find(
+			([ty, tx]) => ty >= 0 && ty < tilesY && tx >= 0 && tx < tilesX && this.#chunks.get(chunkKey(ty, tx))?.stale !== false,
+		);
 	}
 
 	async #loadChunk(page: RendererPage, g: Geometry, ty: number, tx: number): Promise<void> {
@@ -604,7 +621,9 @@ class HtmlViewer implements Component {
 		const cols = this.#tileCols(g, tx);
 		const png = await page.capture(tx * g.imageCols * g.colCss, ty * g.chunkRows * g.rowCss, cols * g.colCss, rows * g.rowCss);
 		if (this.#disposed || generation !== this.#generation || this.#loadedKey !== g.key) return;
-		this.#chunks.set(chunkKey(ty, tx), { ...placeImage(this.#tui, png, cols, rows), ty, tx });
+		const old = this.#chunks.get(chunkKey(ty, tx));
+		this.#chunks.set(chunkKey(ty, tx), { ...placeImage(this.#tui, png, cols, rows), ty, tx, cols, stale: false });
+		if (old) this.#tui.terminal.write(encodeKittyDeleteImage(old.imageId));
 		this.#evictFarChunks(g);
 		this.#tui.requestRender();
 	}

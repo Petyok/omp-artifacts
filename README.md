@@ -74,6 +74,8 @@ In the viewer:
 |---|---|
 | mouse wheel, `j` `k`, `↓` `↑` | scroll |
 | `space` `b`, `PgDn` `PgUp` | page down / up |
+| `h` `l`, `←` `→`, `shift`+wheel, sideways wheel | pan a page wider than the screen (a wide diagram); the status line shows `↔ 40%` |
+| left click | click what is under the pointer in the real page: a node, a tab, a button; the view refreshes |
 | `g` `G` | top / bottom |
 | `m` | desktop or 390 px mobile layout |
 | `r` | reload from disk |
@@ -122,8 +124,9 @@ Everything but HTML and URLs gets a small header with the file name, folder, siz
 
 ## Limits
 
-- The viewer shows a picture of the page: links cannot be clicked and text cannot be selected.
-  `o` opens the real page in a browser.
+- The viewer shows a picture of the page: text cannot be selected, and only a left click is forwarded
+  to it (no hover, drag, keyboard input or wheel inside inner scroll areas). `o` opens the real page
+  in a browser.
 - kitty-style graphics only; other terminals get an error message instead of a broken screen.
 - The queue lives in memory and is empty after an omp restart; the library keeps everything.
 - URLs load without your browser's cookies: a page behind a login shows the login page.

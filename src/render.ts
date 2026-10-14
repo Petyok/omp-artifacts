@@ -20,10 +20,10 @@ const IDLE_TIMEOUT_MS = 5_000;
 
 /**
  * Resolves after the DOM has not changed for 300 ms (at most 2 s), then after web
- * fonts settle, with the page height in CSS px: data fetched after `load` is often
+ * fonts settle, with the page size in CSS px: data fetched after `load` is often
  * rendered a few tasks later, and the last strip must not be cut short.
  */
-const SETTLED_HEIGHT = `new Promise(resolve => {
+const SETTLED_SIZE = `new Promise(resolve => {
 	let quiet;
 	const done = () => { observer.disconnect(); clearTimeout(quiet); clearTimeout(cap); resolve(); };
 	const observer = new MutationObserver(() => { clearTimeout(quiet); quiet = setTimeout(done, 300); });
@@ -32,7 +32,26 @@ const SETTLED_HEIGHT = `new Promise(resolve => {
 	const cap = setTimeout(done, 2000);
 })
 	.then(() => document.fonts.ready)
-	.then(() => Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0))`;
+	.then(() => ({
+		width: Math.max(document.documentElement.scrollWidth, document.body ? document.body.scrollWidth : 0),
+		height: Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0),
+	}))`;
+
+/** Page extent in CSS px; `width` beyond the viewport means the page scrolls sideways. */
+export interface PageSize {
+	width: number;
+	height: number;
+}
+
+function toPageSize(result: unknown): PageSize {
+	const value = result && typeof result === "object" && "value" in result ? (result.value as Partial<PageSize> | null) : null;
+	const width = Number(value?.width);
+	const height = Number(value?.height);
+	return {
+		width: Number.isFinite(width) && width > 0 ? Math.ceil(width) : 1,
+		height: Number.isFinite(height) && height > 0 ? Math.ceil(height) : 1,
+	};
+}
 
 /** True when `promise` settles first, false after `ms`. */
 function within(promise: Promise<unknown>, ms: number): Promise<boolean> {
@@ -79,14 +98,20 @@ function field(result: CdpResult, key: string): string {
 export interface RendererPage {
 	/**
 	 * Navigates (or reloads) `url` at `viewport` and waits for `load`, network idle (≤5 s)
-	 * and a quiet DOM (≤2 s); resolves with the page height in CSS px.
+	 * and a quiet DOM (≤2 s); resolves with the page size in CSS px.
 	 */
-	load(url: string, viewport: Viewport): Promise<number>;
+	load(url: string, viewport: Viewport): Promise<PageSize>;
 	/**
-	 * PNG (base64) of the CSS-px rectangle starting at `y`, at the viewport's device
+	 * PNG (base64) of the CSS-px rectangle starting at (`x`, `y`), at the viewport's device
 	 * scale times `scale` (below 1 for thumbnails).
 	 */
-	capture(y: number, width: number, height: number, scale?: number): Promise<string>;
+	capture(x: number, y: number, width: number, height: number, scale?: number): Promise<string>;
+	/**
+	 * Left-clicks the page at a document CSS-px point (the page is scrolled there first, so
+	 * points below the first screen work), waits for the DOM to settle, and resolves with the
+	 * new page size: a click can open a panel, expand a node or navigate to another document.
+	 */
+	click(x: number, y: number): Promise<PageSize>;
 	close(): void;
 }
 
@@ -181,14 +206,31 @@ export class HtmlRenderer {
 					loaded.cancel();
 					idle.cancel();
 				}
-				const { result } = await call("Runtime.evaluate", { expression: SETTLED_HEIGHT, awaitPromise: true, returnByValue: true });
-				const value = result && typeof result === "object" && "value" in result ? Number(result.value) : Number.NaN;
-				return Number.isFinite(value) && value > 0 ? Math.ceil(value) : 1;
+				const { result } = await call("Runtime.evaluate", { expression: SETTLED_SIZE, awaitPromise: true, returnByValue: true });
+				return toPageSize(result);
 			},
-			capture: async (y, width, height, scale = 1) => {
+			click: async (x, y) => {
+				// Input events are viewport-relative: bring the point into view, click, scroll back so
+				// captures (document coordinates) are unaffected.
+				const evaluate = async (expression: string) =>
+					((await call("Runtime.evaluate", { expression, returnByValue: true })).result as CdpResult | undefined)?.value;
+				const [viewportWidth, viewportHeight] = (await evaluate("[innerWidth, innerHeight]")) as [number, number];
+				// The browser clamps the scroll at the page edges, so read back where it really is.
+				const [scrollX, scrollY] = (await evaluate(
+					`window.scrollTo(${Math.max(0, x - viewportWidth / 2)}, ${Math.max(0, y - viewportHeight / 2)}); [scrollX, scrollY]`,
+				)) as [number, number];
+				const point = { x: x - scrollX, y: y - scrollY };
+				await call("Input.dispatchMouseEvent", { type: "mouseMoved", ...point });
+				await call("Input.dispatchMouseEvent", { type: "mousePressed", ...point, button: "left", clickCount: 1 });
+				await call("Input.dispatchMouseEvent", { type: "mouseReleased", ...point, button: "left", clickCount: 1 });
+				await evaluate("window.scrollTo(0, 0)");
+				const { result } = await call("Runtime.evaluate", { expression: SETTLED_SIZE, awaitPromise: true, returnByValue: true });
+				return toPageSize(result);
+			},
+			capture: async (x, y, width, height, scale = 1) => {
 				const shot = await call("Page.captureScreenshot", {
 					format: "png",
-					clip: { x: 0, y, width, height, scale },
+					clip: { x, y, width, height, scale },
 					captureBeyondViewport: true,
 					// Measured on a 4.9k px report: ~35% faster per capture, PNGs ~30% larger.
 					optimizeForSpeed: true,

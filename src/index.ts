@@ -87,13 +87,13 @@ const MOBILE_CSS_WIDTH = 390;
 /** Cell height (device px) that counts as 1× density when sizing the mobile view. */
 const CELL_HEIGHT_AT_1X = 17;
 /**
- * Strips kept decoded in kitty: the visible ones (at most two) plus one on each
- * side. A strip is one screen tall, ~32 MB decoded on a 4K-wide HiDPI terminal.
+ * Tiles kept decoded in kitty: the visible ones (at most four, when the window straddles a tile
+ * corner) plus the neighbours it can move to. A tile is one screen, ~32 MB decoded on a 4K-wide HiDPI terminal.
  */
-const MAX_LIVE_CHUNKS = 5;
+const MAX_LIVE_CHUNKS = 8;
 /** Rows moved per wheel notch and per j/k. */
 const WHEEL_ROWS = 3;
-/** Sideways pan per step, as a fraction of the viewport width (h/l, ←/→, shift+wheel, horizontal wheel). */
+/** Sideways pan per step, as a fraction of the screen width (h/l, ←/→, shift+wheel, horizontal wheel). */
 const PAN_FRACTION = 0.25;
 /** Writes of these connect to the browser early and become the bare-/view fallback. */
 const PREWARM_RE = /\.(html?|md|markdown)$/i;
@@ -155,6 +155,14 @@ interface Placed {
 	/** One placeholder line per terminal row of the image. */
 	grid: string[];
 }
+
+/** A tile of the page: strip `ty` (screen-tall) of tile column `tx` (screen-wide). */
+interface Chunk extends Placed {
+	ty: number;
+	tx: number;
+}
+
+const chunkKey = (ty: number, tx: number): string => `${ty}:${tx}`;
 
 let imageSeq = 0;
 
@@ -218,6 +226,8 @@ interface Geometry {
 	padCols: number;
 	/** CSS px covered by one terminal row. */
 	rowCss: number;
+	/** CSS px covered by one terminal column. */
+	colCss: number;
 	chunkRows: number;
 }
 
@@ -238,10 +248,11 @@ class HtmlViewer implements Component {
 	#generation = 0;
 	#pageRows = 0;
 	#topRow = 0;
-	/** Page width and the left edge of the visible window, CSS px; the page is wider than the viewport on wide diagrams. */
-	#pageCssWidth = 0;
-	#leftCss = 0;
-	#chunks = new Map<number, Placed>();
+	/** Page width in terminal columns (never below the screen's) and the window's left edge in columns: wide diagrams pan. */
+	#pageCols = 0;
+	#leftCol = 0;
+	/** Screen-sized tiles of the page, by {@link chunkKey}; panning only slices them, so it needs no new capture. */
+	#chunks = new Map<string, Chunk>();
 	#status = "connecting to the browser…";
 	#error = false;
 	#running = false;
@@ -279,11 +290,32 @@ class HtmlViewer implements Component {
 		const current = this.#loadedKey === g.key;
 		for (let r = 0; r < g.imageRows; r++) {
 			const row = this.#topRow + r;
-			const chunk = current && row < this.#pageRows ? this.#chunks.get(Math.floor(row / g.chunkRows)) : undefined;
-			lines.push(chunk ? left + chunk.grid[row % g.chunkRows] : "");
+			lines.push(current && row < this.#pageRows ? left + this.#rowCells(g, row) : "");
 		}
 		lines.push(this.#statusLine(width, g));
 		return lines;
+	}
+
+	/** The screen-wide slice of page row `row`, cut from one or two tiles; columns whose tile is not captured yet stay blank. */
+	#rowCells(g: Geometry, row: number): string {
+		const ty = Math.floor(row / g.chunkRows);
+		const end = Math.min(this.#pageCols, this.#leftCol + g.imageCols);
+		let cells = "";
+		for (let tx = Math.floor(this.#leftCol / g.imageCols); tx * g.imageCols < end; tx++) {
+			const base = tx * g.imageCols;
+			const from = Math.max(this.#leftCol, base);
+			const to = Math.min(end, base + g.imageCols);
+			const chunk = this.#chunks.get(chunkKey(ty, tx));
+			if (!chunk) cells += " ".repeat(to - from);
+			else if (from === base && to - from === this.#tileCols(g, tx)) cells += chunk.grid[row % g.chunkRows];
+			else cells += sliceByColumn(chunk.grid[row % g.chunkRows], from - base, to - from);
+		}
+		return cells;
+	}
+
+	/** Columns in tile column `tx`: a screen, except for the last tile of a wide page. */
+	#tileCols(g: Geometry, tx: number): number {
+		return Math.min(g.imageCols, this.#pageCols - tx * g.imageCols);
 	}
 
 	handleInput(data: string): void {
@@ -384,6 +416,7 @@ class HtmlViewer implements Component {
 			imageRows,
 			padCols: Math.max(0, Math.floor((width - imageCols) / 2)),
 			rowCss: cell.heightPx / scale,
+			colCss: cssWidth / imageCols,
 			chunkRows,
 		};
 	}
@@ -395,9 +428,8 @@ class HtmlViewer implements Component {
 			const maxTop = Math.max(0, this.#pageRows - g.imageRows);
 			const pct = maxTop === 0 ? 100 : Math.round((this.#topRow / maxTop) * 100);
 			parts.push(t.fg("accent", `${this.#mode} ${g.viewport.width}px`), t.fg("muted", `${pct}%`));
-			if (this.#pageCssWidth > g.viewport.width) {
-				const maxLeft = this.#pageCssWidth - g.viewport.width;
-				parts.push(t.fg("accent", `↔ ${Math.round((this.#leftCss / maxLeft) * 100)}%`));
+			if (this.#pageCols > g.imageCols) {
+				parts.push(t.fg("accent", `↔ ${Math.round((this.#leftCol / (this.#pageCols - g.imageCols)) * 100)}%`));
 			}
 		}
 		const status = this.#status || (this.#visibleMissing(g) ? "rendering…" : "");
@@ -408,18 +440,19 @@ class HtmlViewer implements Component {
 		return gap >= 2 ? left + " ".repeat(gap) + help : truncateToWidth(left, width);
 	}
 
-	/** Moves the window sideways by `direction` steps; every strip is captured again at the new offset. */
+	/** Moves the window sideways by `direction` steps, using tiles that are already captured. */
 	#pan(direction: number): void {
 		const g = this.#geometry;
 		if (!g || this.#pageRows === 0) return;
-		const maxLeft = Math.max(0, this.#pageCssWidth - g.viewport.width);
-		const left = Math.min(Math.max(0, this.#leftCss + direction * g.viewport.width * PAN_FRACTION), maxLeft);
-		if (Math.round(left) === Math.round(this.#leftCss)) return;
-		this.#leftCss = left;
-		this.#redraw();
+		const step = Math.max(1, Math.round(g.imageCols * PAN_FRACTION));
+		const left = Math.min(Math.max(0, this.#leftCol + direction * step), Math.max(0, this.#pageCols - g.imageCols));
+		if (left === this.#leftCol) return;
+		this.#leftCol = left;
+		this.#tui.requestRender();
+		this.#kick();
 	}
 
-	/** Throws the captured strips away and fetches the visible ones again. */
+	/** Throws the captured tiles away and fetches the visible ones again (the page changed). */
 	#redraw(): void {
 		this.#dropChunks();
 		this.#generation++;
@@ -434,7 +467,7 @@ class HtmlViewer implements Component {
 		if (!g || !page || this.#loadedKey !== g.key || this.#clicking) return;
 		const cell = col - g.padCols;
 		if (row < 0 || row >= g.imageRows || cell < 0 || cell >= g.imageCols) return;
-		const x = this.#leftCss + ((cell + 0.5) * g.viewport.width) / g.imageCols;
+		const x = (this.#leftCol + cell + 0.5) * g.colCss;
 		const y = (this.#topRow + row + 0.5) * g.rowCss;
 		if (y >= this.#pageRows * g.rowCss) return;
 		const key = g.key;
@@ -460,9 +493,9 @@ class HtmlViewer implements Component {
 	/** Adopts a new page size (after a load or a click), keeping the position inside the new bounds. */
 	#applySize(size: PageSize, g: Geometry): void {
 		this.#pageRows = Math.max(1, Math.ceil(size.height / g.rowCss));
-		this.#pageCssWidth = size.width;
+		this.#pageCols = Math.max(g.imageCols, Math.ceil(size.width / g.colCss - 1e-6));
 		this.#topRow = Math.min(this.#topRow, Math.max(0, this.#pageRows - g.imageRows));
-		this.#leftCss = Math.min(this.#leftCss, Math.max(0, size.width - g.viewport.width));
+		this.#leftCol = Math.min(this.#leftCol, this.#pageCols - g.imageCols);
 	}
 
 	#scrollTo(row: number): void {
@@ -475,16 +508,22 @@ class HtmlViewer implements Component {
 		this.#kick();
 	}
 
-	/** First and last strip index on screen. */
-	#visibleChunks(g: Geometry): [number, number] {
-		const last = Math.min(this.#pageRows, this.#topRow + g.imageRows) - 1;
-		return [Math.floor(this.#topRow / g.chunkRows), Math.floor(Math.max(0, last) / g.chunkRows)];
+	/** First and last tile row and tile column on screen. */
+	#visibleTiles(g: Geometry): { y0: number; y1: number; x0: number; x1: number } {
+		const lastRow = Math.min(this.#pageRows, this.#topRow + g.imageRows) - 1;
+		const lastCol = Math.min(this.#pageCols, this.#leftCol + g.imageCols) - 1;
+		return {
+			y0: Math.floor(this.#topRow / g.chunkRows),
+			y1: Math.floor(Math.max(0, lastRow) / g.chunkRows),
+			x0: Math.floor(this.#leftCol / g.imageCols),
+			x1: Math.floor(Math.max(0, lastCol) / g.imageCols),
+		};
 	}
 
 	#visibleMissing(g: Geometry): boolean {
 		if (this.#loadedKey !== g.key) return true;
-		const [first, last] = this.#visibleChunks(g);
-		for (let c = first; c <= last; c++) if (!this.#chunks.has(c)) return true;
+		const { y0, y1, x0, x1 } = this.#visibleTiles(g);
+		for (let ty = y0; ty <= y1; ty++) for (let tx = x0; tx <= x1; tx++) if (!this.#chunks.has(chunkKey(ty, tx))) return true;
 		return false;
 	}
 
@@ -518,7 +557,7 @@ class HtmlViewer implements Component {
 				}
 				const next = this.#nextChunk(g);
 				if (next === undefined) return;
-				await this.#loadChunk(page, g, next);
+				await this.#loadChunk(page, g, next[0], next[1]);
 			} catch (err) {
 				this.#fail(err);
 				return;
@@ -540,53 +579,57 @@ class HtmlViewer implements Component {
 		// made while the page was loading wins over the old position.
 		const fraction = oldRows > 0 ? this.#topRow / oldRows : 0;
 		this.#topRow = Math.round(fraction * Math.max(1, Math.ceil(size.height / g.rowCss)));
-		this.#leftCss = 0;
+		this.#leftCol = 0;
 		this.#applySize(size, g);
 		this.#loadedKey = g.key;
 		this.#status = "";
 		this.#tui.requestRender();
 	}
 
-	/** Visible strips first, then one ahead and one behind; undefined when none of those is missing. */
-	#nextChunk(g: Geometry): number | undefined {
-		const total = Math.ceil(this.#pageRows / g.chunkRows);
-		const [first, last] = this.#visibleChunks(g);
-		const order: number[] = [];
-		for (let c = first; c <= last; c++) order.push(c);
-		order.push(last + 1, first - 1);
-		return order.find(c => c >= 0 && c < total && !this.#chunks.has(c));
+	/** Visible tiles first, then the sideways and the vertical neighbours; undefined when none of those is missing. */
+	#nextChunk(g: Geometry): [number, number] | undefined {
+		const tilesY = Math.ceil(this.#pageRows / g.chunkRows);
+		const tilesX = Math.ceil(this.#pageCols / g.imageCols);
+		const { y0, y1, x0, x1 } = this.#visibleTiles(g);
+		const order: [number, number][] = [];
+		for (let ty = y0; ty <= y1; ty++) for (let tx = x0; tx <= x1; tx++) order.push([ty, tx]);
+		for (let ty = y0; ty <= y1; ty++) order.push([ty, x1 + 1], [ty, x0 - 1]);
+		for (let tx = x0; tx <= x1; tx++) order.push([y1 + 1, tx], [y0 - 1, tx]);
+		return order.find(([ty, tx]) => ty >= 0 && ty < tilesY && tx >= 0 && tx < tilesX && !this.#chunks.has(chunkKey(ty, tx)));
 	}
 
-	async #loadChunk(page: RendererPage, g: Geometry, index: number): Promise<void> {
+	async #loadChunk(page: RendererPage, g: Geometry, ty: number, tx: number): Promise<void> {
 		const generation = this.#generation;
-		const rows = Math.min(g.chunkRows, this.#pageRows - index * g.chunkRows);
-		const png = await page.capture(this.#leftCss, index * g.chunkRows * g.rowCss, g.viewport.width, rows * g.rowCss);
+		const rows = Math.min(g.chunkRows, this.#pageRows - ty * g.chunkRows);
+		const cols = this.#tileCols(g, tx);
+		const png = await page.capture(tx * g.imageCols * g.colCss, ty * g.chunkRows * g.rowCss, cols * g.colCss, rows * g.rowCss);
 		if (this.#disposed || generation !== this.#generation || this.#loadedKey !== g.key) return;
-		this.#chunks.set(index, placeImage(this.#tui, png, g.imageCols, rows));
+		this.#chunks.set(chunkKey(ty, tx), { ...placeImage(this.#tui, png, cols, rows), ty, tx });
 		this.#evictFarChunks(g);
 		this.#tui.requestRender();
 	}
 
 	/**
-	 * Keeps kitty's image memory bounded: drops the strips farthest from the screen,
-	 * never one inside the prefetch window, so eviction cannot fight #nextChunk.
+	 * Keeps kitty's image memory bounded: drops the tiles farthest from the screen,
+	 * never one next to it, so eviction cannot fight #nextChunk.
 	 */
 	#evictFarChunks(g: Geometry): void {
-		const [first, last] = this.#visibleChunks(g);
+		const { y0, y1, x0, x1 } = this.#visibleTiles(g);
 		while (this.#chunks.size > MAX_LIVE_CHUNKS) {
-			let far: number | undefined;
+			let far: Chunk | undefined;
 			let farDistance = 0;
-			for (const index of this.#chunks.keys()) {
-				const distance = index < first ? first - index : index - last;
+			for (const chunk of this.#chunks.values()) {
+				const dy = chunk.ty < y0 ? y0 - chunk.ty : Math.max(0, chunk.ty - y1);
+				const dx = chunk.tx < x0 ? x0 - chunk.tx : Math.max(0, chunk.tx - x1);
+				const distance = Math.max(dy, dx);
 				if (distance > 1 && distance > farDistance) {
-					far = index;
+					far = chunk;
 					farDistance = distance;
 				}
 			}
-			if (far === undefined) return;
-			const chunk = this.#chunks.get(far);
-			this.#chunks.delete(far);
-			if (chunk) this.#tui.terminal.write(encodeKittyDeleteImage(chunk.imageId));
+			if (!far) return;
+			this.#chunks.delete(chunkKey(far.ty, far.tx));
+			this.#tui.terminal.write(encodeKittyDeleteImage(far.imageId));
 		}
 	}
 

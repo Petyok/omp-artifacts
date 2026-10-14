@@ -20,8 +20,8 @@
  * placeholder cell names its own image row, so scrolling is just printing a
  * different slice of rows. No re-render per scroll step.
  *
- * Viewer keys: wheel / j k ↓↑ scroll · space b PgDn PgUp page · g G top/bottom ·
- * m desktop/mobile (390 px) · r reload from disk · o system browser · q Esc close.
+ * Viewer keys: wheel / j k ↓↑ scroll · h l ←→ shift+wheel pan wide pages · click presses what is
+ * under the pointer · space b PgDn PgUp page · g G top/bottom · m desktop/mobile (390 px) · r reload from disk · o system browser · q Esc close.
  *
  * The card title is an OSC 8 link `omp-artifacts://open`, its "dismiss all" button one to
  * `omp-artifacts://dismiss-all`; kitty maps a click on them to the shortcuts in
@@ -78,7 +78,7 @@ import {
 	tildify,
 	touchCache,
 } from "./artifacts.ts";
-import { HtmlRenderer, type RendererPage, type Viewport } from "./render.ts";
+import { HtmlRenderer, type PageSize, type RendererPage, type Viewport } from "./render.ts";
 import pkg from "../package.json" with { type: "json" };
 
 /** Desktop layouts are rendered at most this wide (CSS px); wider terminals get a higher device scale. */
@@ -93,6 +93,8 @@ const CELL_HEIGHT_AT_1X = 17;
 const MAX_LIVE_CHUNKS = 5;
 /** Rows moved per wheel notch and per j/k. */
 const WHEEL_ROWS = 3;
+/** Sideways pan per step, as a fraction of the viewport width (h/l, ←/→, shift+wheel, horizontal wheel). */
+const PAN_FRACTION = 0.25;
 /** Writes of these connect to the browser early and become the bare-/view fallback. */
 const PREWARM_RE = /\.(html?|md|markdown)$/i;
 /** Opens the queue head; unbound in omp's default keymap. */
@@ -186,7 +188,7 @@ function renderThumb(target: Target, cols: number, rows: number): Promise<string
 			const cssHeight = heightPx / scale;
 			const viewport = { width: DESKTOP_CSS_WIDTH, height: Math.round(cssHeight), deviceScaleFactor: 1, mobile: false };
 			await page.load(await pageUrl(target), viewport);
-			const png = await page.capture(0, DESKTOP_CSS_WIDTH, cssHeight, scale);
+			const png = await page.capture(0, 0, DESKTOP_CSS_WIDTH, cssHeight, scale);
 			fs.mkdirSync(path.dirname(cached), { recursive: true });
 			fs.writeFileSync(cached, Buffer.from(png, "base64"));
 			return png;
@@ -236,10 +238,14 @@ class HtmlViewer implements Component {
 	#generation = 0;
 	#pageRows = 0;
 	#topRow = 0;
+	/** Page width and the left edge of the visible window, CSS px; the page is wider than the viewport on wide diagrams. */
+	#pageCssWidth = 0;
+	#leftCss = 0;
 	#chunks = new Map<number, Placed>();
 	#status = "connecting to the browser…";
 	#error = false;
 	#running = false;
+	#clicking = false;
 	/** A kick arrived while the worker was running; run it again once it exits. */
 	#rerun = false;
 	#disposed = false;
@@ -282,7 +288,11 @@ class HtmlViewer implements Component {
 
 	handleInput(data: string): void {
 		const isMouse = routeSgrMouseInput(data, event => {
-			if (event.wheel) this.#scrollTo(this.#topRow + event.wheel * WHEEL_ROWS);
+			// pi-tui reports no direction for horizontal wheel buttons (66 left, 67 right).
+			if (event.button === 66 || event.button === 67) this.#pan(event.button === 67 ? 1 : -1);
+			else if (event.wheel && event.button & 4) this.#pan(event.wheel);
+			else if (event.wheel) this.#scrollTo(this.#topRow + event.wheel * WHEEL_ROWS);
+			else if (event.leftClick) this.#click(event.col, event.row);
 			return true;
 		});
 		if (isMouse || isKeyRelease(data)) return;
@@ -305,6 +315,12 @@ class HtmlViewer implements Component {
 			case "b":
 			case "pageUp":
 				return this.#scrollTo(this.#topRow - page);
+			case "h":
+			case "left":
+				return this.#pan(-1);
+			case "l":
+			case "right":
+				return this.#pan(1);
 			case "g":
 			case "home":
 				return this.#scrollTo(0);
@@ -379,13 +395,74 @@ class HtmlViewer implements Component {
 			const maxTop = Math.max(0, this.#pageRows - g.imageRows);
 			const pct = maxTop === 0 ? 100 : Math.round((this.#topRow / maxTop) * 100);
 			parts.push(t.fg("accent", `${this.#mode} ${g.viewport.width}px`), t.fg("muted", `${pct}%`));
+			if (this.#pageCssWidth > g.viewport.width) {
+				const maxLeft = this.#pageCssWidth - g.viewport.width;
+				parts.push(t.fg("accent", `↔ ${Math.round((this.#leftCss / maxLeft) * 100)}%`));
+			}
 		}
 		const status = this.#status || (this.#visibleMissing(g) ? "rendering…" : "");
 		if (status) parts.push(this.#error ? t.fg("error", status) : t.fg("warning", status));
 		const left = parts.join("  ");
-		const help = t.fg("dim", "wheel j/k space/b g/G · m mobile · r reload · o browser · q close ");
+		const help = t.fg("dim", "wheel j/k space/b g/G · h/l pan · click · m mobile · r reload · o browser · q close ");
 		const gap = width - visibleWidth(left) - visibleWidth(help);
 		return gap >= 2 ? left + " ".repeat(gap) + help : truncateToWidth(left, width);
+	}
+
+	/** Moves the window sideways by `direction` steps; every strip is captured again at the new offset. */
+	#pan(direction: number): void {
+		const g = this.#geometry;
+		if (!g || this.#pageRows === 0) return;
+		const maxLeft = Math.max(0, this.#pageCssWidth - g.viewport.width);
+		const left = Math.min(Math.max(0, this.#leftCss + direction * g.viewport.width * PAN_FRACTION), maxLeft);
+		if (Math.round(left) === Math.round(this.#leftCss)) return;
+		this.#leftCss = left;
+		this.#redraw();
+	}
+
+	/** Throws the captured strips away and fetches the visible ones again. */
+	#redraw(): void {
+		this.#dropChunks();
+		this.#generation++;
+		this.#tui.requestRender();
+		this.#kick();
+	}
+
+	/** Sends a left click at terminal cell (`col`, `row`) to the page; the image is a picture, so the cell is mapped back to CSS px. */
+	#click(col: number, row: number): void {
+		const g = this.#geometry;
+		const page = this.#page;
+		if (!g || !page || this.#loadedKey !== g.key || this.#clicking) return;
+		const cell = col - g.padCols;
+		if (row < 0 || row >= g.imageRows || cell < 0 || cell >= g.imageCols) return;
+		const x = this.#leftCss + ((cell + 0.5) * g.viewport.width) / g.imageCols;
+		const y = (this.#topRow + row + 0.5) * g.rowCss;
+		if (y >= this.#pageRows * g.rowCss) return;
+		const key = g.key;
+		this.#clicking = true;
+		this.#status = "clicking…";
+		this.#error = false;
+		this.#tui.requestRender();
+		page.click(x, y).then(
+			size => {
+				this.#clicking = false;
+				if (this.#disposed || this.#loadedKey !== key) return;
+				this.#status = "";
+				this.#applySize(size, g);
+				this.#redraw();
+			},
+			err => {
+				this.#clicking = false;
+				this.#fail(err);
+			},
+		);
+	}
+
+	/** Adopts a new page size (after a load or a click), keeping the position inside the new bounds. */
+	#applySize(size: PageSize, g: Geometry): void {
+		this.#pageRows = Math.max(1, Math.ceil(size.height / g.rowCss));
+		this.#pageCssWidth = size.width;
+		this.#topRow = Math.min(this.#topRow, Math.max(0, this.#pageRows - g.imageRows));
+		this.#leftCss = Math.min(this.#leftCss, Math.max(0, size.width - g.viewport.width));
 	}
 
 	#scrollTo(row: number): void {
@@ -455,15 +532,16 @@ class HtmlViewer implements Component {
 		this.#error = false;
 		this.#tui.requestRender();
 		this.#loadedUrl = await pageUrl(this.#target);
-		const height = await page.load(this.#loadedUrl, g.viewport);
+		const size = await page.load(this.#loadedUrl, g.viewport);
 		if (this.#disposed) return;
 		this.#dropChunks();
 		this.#generation++;
 		// Keep the reader's relative position; read topRow only now, so a scroll
 		// made while the page was loading wins over the old position.
 		const fraction = oldRows > 0 ? this.#topRow / oldRows : 0;
-		this.#pageRows = Math.max(1, Math.ceil(height / g.rowCss));
-		this.#topRow = Math.min(Math.round(fraction * this.#pageRows), Math.max(0, this.#pageRows - g.imageRows));
+		this.#topRow = Math.round(fraction * Math.max(1, Math.ceil(size.height / g.rowCss)));
+		this.#leftCss = 0;
+		this.#applySize(size, g);
 		this.#loadedKey = g.key;
 		this.#status = "";
 		this.#tui.requestRender();
@@ -482,7 +560,7 @@ class HtmlViewer implements Component {
 	async #loadChunk(page: RendererPage, g: Geometry, index: number): Promise<void> {
 		const generation = this.#generation;
 		const rows = Math.min(g.chunkRows, this.#pageRows - index * g.chunkRows);
-		const png = await page.capture(index * g.chunkRows * g.rowCss, g.viewport.width, rows * g.rowCss);
+		const png = await page.capture(this.#leftCss, index * g.chunkRows * g.rowCss, g.viewport.width, rows * g.rowCss);
 		if (this.#disposed || generation !== this.#generation || this.#loadedKey !== g.key) return;
 		this.#chunks.set(index, placeImage(this.#tui, png, g.imageCols, rows));
 		this.#evictFarChunks(g);

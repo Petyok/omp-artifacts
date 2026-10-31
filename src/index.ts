@@ -1260,6 +1260,13 @@ export default function htmlView(pi: ExtensionAPI): void {
 			const target = resolveTarget(params.path, ctx.cwd, params.title);
 			if (typeof target === "string") return { content: [{ type: "text", text: target }], isError: true };
 			recordInLibrary(target, ctx.cwd);
+			// A desktop or web host that sets this shows the file itself from the tool call it watches.
+			if (process.env.OMP_ARTIFACTS_EXTERNAL_VIEWER) {
+				return {
+					content: [{ type: "text", text: `Sent ${target.label} to the user's artifact viewer; it is also in the Artifact Library.` }],
+					details: { source: target.source, kind: target.kind, queued: 0 },
+				};
+			}
 			if (!mainUi || notKitty()) {
 				return {
 					content: [{ type: "text", text: `No preview queue in this session (no kitty UI); added to the Artifact Library. The file is ${target.source}.` }],

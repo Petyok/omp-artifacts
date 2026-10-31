@@ -127,7 +127,9 @@ Everything but HTML and URLs gets a small header with the file name, folder, siz
 - The viewer shows a picture of the page: text cannot be selected, and only a left click is forwarded
   to it (no hover, drag, keyboard input or wheel inside inner scroll areas). `o` opens the real page
   in a browser.
-- kitty-style graphics only; other terminals get an error message instead of a broken screen.
+- kitty-style graphics only; other terminals get an error message instead of a broken screen. A desktop
+  or web front end that shows files itself can set `OMP_ARTIFACTS_EXTERNAL_VIEWER=1` in omp's
+  environment: `show_artifact` then succeeds without kitty and still records the file in the library.
 - The queue lives in memory and is empty after an omp restart; the library keeps everything.
 - URLs load without your browser's cookies: a page behind a login shows the login page.
 

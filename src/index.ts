@@ -1244,11 +1244,15 @@ export default function htmlView(pi: ExtensionAPI): void {
 		return undefined;
 	});
 
+	// A desktop or web host that sets this shows the file itself from the tool call it watches.
+	const externalViewer = process.env.OMP_ARTIFACTS_EXTERNAL_VIEWER === "1";
+
 	pi.registerTool({
 		name: "show_artifact",
 		label: "Show artifact",
-		description:
-			"Put a file the user should look at into their preview queue: an HTML report or mockup, Markdown, plain text or code, an image, a PDF, or an http(s) URL. A card with a thumbnail appears above the prompt; the user opens it inside omp with alt+o or a click, and it stays in their Artifact Library afterwards. Returns at once. Afterwards tell the user it is in their preview queue instead of describing how to open the file.",
+		description: externalViewer
+			? "Show the user a file they should look at: an HTML report or mockup, Markdown, plain text or code, an image, a PDF, or an http(s) URL. Their app opens it in its artifact viewer, and it stays in their Artifact Library. Returns at once. Afterwards tell the user the file is open in their viewer instead of describing how to open it."
+			: "Put a file the user should look at into their preview queue: an HTML report or mockup, Markdown, plain text or code, an image, a PDF, or an http(s) URL. A card with a thumbnail appears above the prompt; the user opens it inside omp with alt+o or a click, and it stays in their Artifact Library afterwards. Returns at once. Afterwards tell the user it is in their preview queue instead of describing how to open the file.",
 		parameters: z.object({
 			path: z.string().describe("File (relative to the working directory, or absolute) or an http(s) URL"),
 			title: z.string().optional().describe("Card title; defaults to the file name"),
@@ -1260,10 +1264,9 @@ export default function htmlView(pi: ExtensionAPI): void {
 			const target = resolveTarget(params.path, ctx.cwd, params.title);
 			if (typeof target === "string") return { content: [{ type: "text", text: target }], isError: true };
 			recordInLibrary(target, ctx.cwd);
-			// A desktop or web host that sets this shows the file itself from the tool call it watches.
-			if (process.env.OMP_ARTIFACTS_EXTERNAL_VIEWER) {
+			if (externalViewer) {
 				return {
-					content: [{ type: "text", text: `Sent ${target.label} to the user's artifact viewer; it is also in the Artifact Library.` }],
+					content: [{ type: "text", text: `The host shows ${target.label}; it is also in the Artifact Library.` }],
 					details: { source: target.source, kind: target.kind, queued: 0 },
 				};
 			}

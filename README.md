@@ -72,7 +72,7 @@ In the viewer:
 
 | Keys | |
 |---|---|
-| mouse wheel, `j` `k`, `↓` `↑` | scroll |
+| `j` `k`, `↓` `↑`, mouse wheel | scroll |
 | `space` `b`, `PgDn` `PgUp` | page down / up |
 | `h` `l`, `←` `→`, `shift`+wheel, sideways wheel | pan a page wider than the screen (a wide diagram); the status line shows `↔ 40%` |
 | left click | click what is under the pointer in the real page: a node, a tab, a button; the view refreshes |
@@ -86,6 +86,9 @@ In the library: `Tab` switches between this project and all projects, type to fi
 project folder), `↑` `↓` or the wheel to move, `Enter` or a click to open, `ctrl+d` (or `Del`) to forget an
 entry (the file stays; it asks first, and "yes, and don't ask again" stops asking until the next session),
 `ctrl+o` to open in the browser, `Esc` to close.
+
+The mouse wheel and clicks in the viewer and the library arrive only while omp's `tui.mouse` setting is on;
+without it, use the keys.
 
 ![Markdown in the viewer](docs/viewer-markdown.webp)
 

@@ -4,7 +4,7 @@
  *   show_artifact (tool)       the agent queues a file; a card with a thumbnail appears
  *                              above the prompt, right-aligned
  *   alt+o, or a click on the   opens the newest card's artifact; closing the viewer
- *   card's title               takes it off the queue
+ *   card's title (kitty)       takes it off the queue
  *   alt+x                      dismisses the newest card unopened; it stays in the library
  *   alt+shift+x, or a click    dismisses the whole queue; the card shows that button
  *   on its "dismiss all"       when 2+ are queued
@@ -20,8 +20,10 @@
  * placeholder cell names its own image row, so scrolling is just printing a
  * different slice of rows. No re-render per scroll step.
  *
- * Viewer keys: wheel / j k ↓↑ scroll · h l ←→ shift+wheel pan wide pages · click presses what is
- * under the pointer · space b PgDn PgUp page · g G top/bottom · m desktop/mobile (390 px) · r reload from disk · o system browser · q Esc close.
+ * Viewer keys: j k ↓↑ scroll · h l ←→ pan wide pages · space b PgDn PgUp page · g G top/bottom ·
+ * m desktop/mobile (390 px) · r reload from disk · o system browser · q Esc close. With omp's
+ * `tui.mouse` setting on, the wheel scrolls (shift+wheel or horizontal wheel pans) and a click
+ * presses what is under the pointer.
  *
  * The card title is an OSC 8 link `omp-artifacts://open`, its "dismiss all" button one to
  * `omp-artifacts://dismiss-all`; kitty maps a click on them to the shortcuts in
@@ -39,28 +41,25 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { decodeInput } from "@oh-my-pi/pi-tui/driver/input/decoder";
+import type { InputEvent, MouseEvent } from "@oh-my-pi/pi-tui/driver/contract";
+import { DEFAULT_CELL } from "@oh-my-pi/pi-tui/driver/images/fit";
 import {
-	type Component,
-	encodeKittyDeleteImage,
-	encodeKittyPlaceholderGrid,
-	encodeKittyTransmit,
-	encodeKittyVirtualPlacement,
-	extractPrintableText,
-	getCellDimensions,
-	getKittyGraphics,
-	ImageProtocol,
-	isKeyRelease,
+	KITTY_MAX_ID,
 	KITTY_PLACEHOLDER_MAX_CELLS,
-	type OverlayHandle,
-	type OverlayOptions,
-	parseKey,
-	routeSgrMouseInput,
-	sliceByColumn,
-	TERMINAL,
-	type TUI,
-	truncateToWidth,
-	visibleWidth,
-} from "@oh-my-pi/pi-tui";
+	kittyDelete,
+	kittyPlaceholderRows,
+	kittyPlaceholdersSupported,
+	kittyTransmit,
+	kittyVirtualPlace,
+} from "@oh-my-pi/pi-tui/driver/images/kitty";
+import {
+	activeTerminalDriver,
+	terminalCapabilities,
+	terminalIdentity,
+	writeTerminalSequence,
+} from "@oh-my-pi/pi-tui/driver/session";
+import { sliceCells, sliceColumns, truncate, visibleWidth } from "@oh-my-pi/pi-tui/text/width";
 import {
 	type FileInfo,
 	fileInfo,
@@ -110,9 +109,44 @@ const THUMB_COLS = 14;
 const THUMB_ROWS = 3;
 const CARD_TEXT_COLS = 48;
 
-const FULLSCREEN: OverlayOptions = { fullscreen: true, mouseTracking: true, width: "100%", maxHeight: "100%", row: 0, col: 0 };
+/** What the extension needs of the host passed to custom views and widgets. */
+interface UiHost {
+	requestRender(): void;
+	size(): { columns: number; rows: number };
+}
 
-const notKitty = (): boolean => TERMINAL.imageProtocol !== ImageProtocol.Kitty || !getKittyGraphics().unicodePlaceholders;
+/** A view as omp 19 draws it: rows of styled text, raw key input, cleanup. */
+interface Rows {
+	render(width: number): string[];
+	handleInput?(data: string): void;
+	dispose?(): void;
+}
+
+const FULLSCREEN = { overlay: true, fullscreen: true } as const;
+
+const notKitty = (): boolean =>
+	terminalCapabilities().images !== "kitty" || !kittyPlaceholdersSupported(terminalIdentity().id, Bun.env);
+
+/** Cell size in device px: probed by the host, a default until the reply arrives. */
+const cellSize = (): { widthPx: number; heightPx: number } => {
+	const cell = terminalCapabilities().cell ?? DEFAULT_CELL;
+	return { widthPx: cell.w, heightPx: cell.h };
+};
+
+/** Decodes the raw input `handleInput` receives into one key event. */
+function keyOf(data: string) {
+	const event = decodeInput(data, { kitty: true })[0];
+	return event?.type === "key" ? event.key : undefined;
+}
+
+/** Calls `listener` for each mouse report the terminal sends, which happens while omp's `tui.mouse` is on. */
+function onMouse(listener: (mouse: MouseEvent) => void): () => void {
+	return (
+		activeTerminalDriver()?.onInput((event: InputEvent) => {
+			if (event.type === "mouse") listener(event.mouse);
+		}) ?? (() => {})
+	);
+}
 
 function ago(ms: number): string {
 	const s = Math.round(ms / 1000);
@@ -124,7 +158,7 @@ function ago(ms: number): string {
 
 /** Pads an already-fitting styled string to `cols` cells. */
 const pad = (styled: string, cols: number): string => styled + " ".repeat(Math.max(0, cols - visibleWidth(styled)));
-const fit = (styled: string, cols: number): string => pad(truncateToWidth(styled, cols), cols);
+const fit = (styled: string, cols: number): string => pad(truncate(styled, cols), cols);
 const link = (s: string, url = CARD_LINK): string => `\x1b]8;;${url}\x1b\\${s}\x1b]8;;\x1b\\`;
 
 function openExternally(url: string): void {
@@ -168,14 +202,20 @@ interface Chunk extends Placed {
 
 const chunkKey = (ty: number, tx: number): string => `${ty}:${tx}`;
 
+/** Kitty image ids stay inside the 24 bits a placeholder colour carries; a random base keeps clear of the host's own images. */
+const IMAGE_ID_SPAN = 0x1_0000;
+const imageIdBase = 1 + Math.floor(Math.random() * (KITTY_MAX_ID - IMAGE_ID_SPAN));
 let imageSeq = 0;
 
+const multiplexer = () => terminalCapabilities().multiplexer;
+const deleteImage = (id: number): string => kittyDelete(id, multiplexer());
+
 /** Sends a PNG to kitty and returns the placeholder lines that display it at `columns`×`rows`. */
-function placeImage(tui: TUI, png: string, columns: number, rows: number): Placed {
-	const imageId = tui.imageBudget.acquireId(`omp-artifacts:${process.pid}:${++imageSeq}`);
-	const placement = { imageId, columns, rows };
-	tui.terminal.write(encodeKittyTransmit(png, imageId) + encodeKittyVirtualPlacement(placement));
-	return { imageId, grid: encodeKittyPlaceholderGrid(placement) };
+function placeImage(png: string, columns: number, rows: number): Placed {
+	const imageId = imageIdBase + (imageSeq++ % IMAGE_ID_SPAN);
+	const placement = { id: imageId, columns, rows };
+	writeTerminalSequence(kittyTransmit(png, imageId, multiplexer()) + kittyVirtualPlace(placement, multiplexer()));
+	return { imageId, grid: kittyPlaceholderRows(placement) };
 }
 
 let thumbChain: Promise<unknown> = Promise.resolve();
@@ -185,7 +225,7 @@ let thumbChain: Promise<unknown> = Promise.resolve();
  * cache when the file has not changed. Renders one at a time.
  */
 function renderThumb(target: Target, cols: number, rows: number): Promise<string> {
-	const cell = getCellDimensions();
+	const cell = cellSize();
 	const widthPx = cols * cell.widthPx;
 	const heightPx = rows * cell.heightPx;
 	const cached = thumbCachePath(target, widthPx, heightPx);
@@ -235,8 +275,8 @@ interface Geometry {
 	chunkRows: number;
 }
 
-class HtmlViewer implements Component {
-	#tui: TUI;
+class HtmlViewer implements Rows {
+	#ui: UiHost;
 	#theme: ViewerTheme;
 	#done: () => void;
 	#target: Target;
@@ -264,10 +304,16 @@ class HtmlViewer implements Component {
 	/** A kick arrived while the worker was running; run it again once it exits. */
 	#rerun = false;
 	#disposed = false;
+	#unsubscribe: Array<() => void> = [];
 
-	constructor(tui: TUI, theme: ViewerTheme, done: () => void, target: Target) {
-		this.#tui = tui;
+	constructor(ui: UiHost, theme: ViewerTheme, done: () => void, target: Target) {
+		this.#ui = ui;
 		this.#theme = theme;
+		// The cell size arrives as a late probe reply; draw again with it.
+		this.#unsubscribe.push(
+			onMouse(mouse => this.#mouse(mouse)),
+			activeTerminalDriver()?.onCapabilities(() => ui.requestRender()) ?? (() => {}),
+		);
 		this.#done = done;
 		this.#target = target;
 		getRenderer()
@@ -282,8 +328,8 @@ class HtmlViewer implements Component {
 			);
 	}
 
-	render(width: number): readonly string[] {
-		const rows = Math.max(4, this.#tui.terminal.rows);
+	render(width: number): string[] {
+		const rows = Math.max(4, this.#ui.size().rows);
 		const g = this.#measure(width, rows);
 		if (g.key !== this.#geometry?.key) {
 			this.#geometry = g;
@@ -313,7 +359,7 @@ class HtmlViewer implements Component {
 			const line = chunk && chunk.cols === this.#tileCols(g, tx) ? chunk.grid[row % g.chunkRows] : undefined;
 			if (line === undefined) cells += " ".repeat(to - from);
 			else if (from === base && to - from === chunk?.cols) cells += line;
-			else cells += sliceByColumn(line, from - base, to - from);
+			else cells += sliceColumns(line, from - base, to - base);
 		}
 		return cells;
 	}
@@ -323,18 +369,18 @@ class HtmlViewer implements Component {
 		return Math.min(g.imageCols, this.#pageCols - tx * g.imageCols);
 	}
 
+	#mouse(mouse: MouseEvent): void {
+		const wheel = mouse.button === "wheel-down" ? 1 : mouse.button === "wheel-up" ? -1 : 0;
+		if (mouse.button === "wheel-left") this.#pan(-1);
+		else if (mouse.button === "wheel-right") this.#pan(1);
+		else if (wheel && mouse.mods.includes("shift")) this.#pan(wheel);
+		else if (wheel) this.#scrollTo(this.#topRow + wheel * WHEEL_ROWS);
+		else if (mouse.button === "left" && mouse.action === "press") this.#click(mouse.col, mouse.row);
+	}
+
 	handleInput(data: string): void {
-		const isMouse = routeSgrMouseInput(data, event => {
-			// pi-tui reports no direction for horizontal wheel buttons (66 left, 67 right).
-			if (event.button === 66 || event.button === 67) this.#pan(event.button === 67 ? 1 : -1);
-			else if (event.wheel && event.button & 4) this.#pan(event.wheel);
-			else if (event.wheel) this.#scrollTo(this.#topRow + event.wheel * WHEEL_ROWS);
-			else if (event.leftClick) this.#click(event.col, event.row);
-			return true;
-		});
-		if (isMouse || isKeyRelease(data)) return;
 		const page = Math.max(1, (this.#geometry?.imageRows ?? 20) - 2);
-		switch (parseKey(data) ?? data) {
+		switch (keyOf(data)?.id) {
 			case "q":
 			case "escape":
 				this.#done();
@@ -361,13 +407,12 @@ class HtmlViewer implements Component {
 			case "g":
 			case "home":
 				return this.#scrollTo(0);
-			case "G":
 			case "shift+g":
 			case "end":
 				return this.#scrollTo(Number.MAX_SAFE_INTEGER);
 			case "m":
 				this.#mode = this.#mode === "desktop" ? "mobile" : "desktop";
-				this.#tui.requestRender();
+				this.#ui.requestRender();
 				return;
 			case "r":
 				this.#loadedKey = undefined;
@@ -376,23 +421,22 @@ class HtmlViewer implements Component {
 			case "o":
 				openExternally(this.#loadedUrl ?? this.#target.source);
 				this.#status = "opened in the system browser";
-				this.#tui.requestRender();
+				this.#ui.requestRender();
 				return;
 		}
 	}
 
-	invalidate(): void {}
-
 	dispose(): void {
 		if (this.#disposed) return;
 		this.#disposed = true;
+		for (const stop of this.#unsubscribe) stop();
 		this.#dropChunks();
 		// Still connecting: the open callback closes the tab once it sees #disposed.
 		this.#page?.close();
 	}
 
 	#measure(width: number, rows: number): Geometry {
-		const cell = getCellDimensions();
+		const cell = cellSize();
 		const imageRows = rows - 1;
 		const maxCols = Math.min(width - 2, KITTY_PLACEHOLDER_MAX_CELLS);
 		let imageCols: number;
@@ -440,9 +484,9 @@ class HtmlViewer implements Component {
 		const status = this.#status || (this.#visibleMissing(g) ? "rendering…" : "");
 		if (status) parts.push(this.#error ? t.fg("error", status) : t.fg("warning", status));
 		const left = parts.join("  ");
-		const help = t.fg("dim", "wheel j/k space/b g/G · h/l pan · click · m mobile · r reload · o browser · q close ");
+		const help = t.fg("dim", "j/k space/b g/G · h/l pan · m mobile · r reload · o browser · q close ");
 		const gap = width - visibleWidth(left) - visibleWidth(help);
-		return gap >= 2 ? left + " ".repeat(gap) + help : truncateToWidth(left, width);
+		return gap >= 2 ? left + " ".repeat(gap) + help : truncate(left, width);
 	}
 
 	/** Moves the window sideways by `direction` steps, using tiles that are already captured. */
@@ -453,7 +497,7 @@ class HtmlViewer implements Component {
 		const left = Math.min(Math.max(0, this.#leftCol + direction * step), Math.max(0, this.#pageCols - g.imageCols));
 		if (left === this.#leftCol) return;
 		this.#leftCol = left;
-		this.#tui.requestRender();
+		this.#ui.requestRender();
 		this.#kick();
 	}
 
@@ -468,10 +512,10 @@ class HtmlViewer implements Component {
 		for (const [key, chunk] of this.#chunks) {
 			if (chunk.ty >= tilesY || chunk.tx >= tilesX) {
 				this.#chunks.delete(key);
-				this.#tui.terminal.write(encodeKittyDeleteImage(chunk.imageId));
+				writeTerminalSequence(deleteImage(chunk.imageId));
 			} else chunk.stale = true;
 		}
-		this.#tui.requestRender();
+		this.#ui.requestRender();
 		this.#kick();
 	}
 
@@ -489,7 +533,7 @@ class HtmlViewer implements Component {
 		this.#clicking = true;
 		this.#status = "clicking…";
 		this.#error = false;
-		this.#tui.requestRender();
+		this.#ui.requestRender();
 		page.click(x, y).then(
 			size => {
 				this.#clicking = false;
@@ -519,7 +563,7 @@ class HtmlViewer implements Component {
 		const top = Math.min(Math.max(0, row), Math.max(0, this.#pageRows - g.imageRows));
 		if (top === this.#topRow) return;
 		this.#topRow = top;
-		this.#tui.requestRender();
+		this.#ui.requestRender();
 		this.#kick();
 	}
 
@@ -584,7 +628,7 @@ class HtmlViewer implements Component {
 		const oldRows = this.#pageRows;
 		this.#status = "rendering…";
 		this.#error = false;
-		this.#tui.requestRender();
+		this.#ui.requestRender();
 		this.#loadedUrl = await pageUrl(this.#target);
 		const size = await page.load(this.#loadedUrl, g.viewport);
 		if (this.#disposed) return;
@@ -598,7 +642,7 @@ class HtmlViewer implements Component {
 		this.#applySize(size, g);
 		this.#loadedKey = g.key;
 		this.#status = "";
-		this.#tui.requestRender();
+		this.#ui.requestRender();
 	}
 
 	/** Visible tiles first, then the sideways and the vertical neighbours; undefined when none of those is missing. */
@@ -622,10 +666,10 @@ class HtmlViewer implements Component {
 		const png = await page.capture(tx * g.imageCols * g.colCss, ty * g.chunkRows * g.rowCss, cols * g.colCss, rows * g.rowCss);
 		if (this.#disposed || generation !== this.#generation || this.#loadedKey !== g.key) return;
 		const old = this.#chunks.get(chunkKey(ty, tx));
-		this.#chunks.set(chunkKey(ty, tx), { ...placeImage(this.#tui, png, cols, rows), ty, tx, cols, stale: false });
-		if (old) this.#tui.terminal.write(encodeKittyDeleteImage(old.imageId));
+		this.#chunks.set(chunkKey(ty, tx), { ...placeImage(png, cols, rows), ty, tx, cols, stale: false });
+		if (old) writeTerminalSequence(deleteImage(old.imageId));
 		this.#evictFarChunks(g);
-		this.#tui.requestRender();
+		this.#ui.requestRender();
 	}
 
 	/**
@@ -648,30 +692,27 @@ class HtmlViewer implements Component {
 			}
 			if (!far) return;
 			this.#chunks.delete(chunkKey(far.ty, far.tx));
-			this.#tui.terminal.write(encodeKittyDeleteImage(far.imageId));
+			writeTerminalSequence(deleteImage(far.imageId));
 		}
 	}
 
 	#dropChunks(): void {
 		let deletes = "";
-		for (const chunk of this.#chunks.values()) deletes += encodeKittyDeleteImage(chunk.imageId);
+		for (const chunk of this.#chunks.values()) deletes += deleteImage(chunk.imageId);
 		this.#chunks.clear();
-		if (deletes) this.#tui.terminal.write(deletes);
+		if (deletes) writeTerminalSequence(deletes);
 	}
 
 	#fail(err: unknown): void {
 		this.#status = err instanceof Error ? err.message : String(err);
 		this.#error = true;
-		this.#tui.requestRender();
+		this.#ui.requestRender();
 	}
 }
 
-/** Opens the fullscreen viewer (alternate screen, so the terminal reports the mouse wheel). */
+/** Opens the fullscreen viewer (alternate screen). */
 async function openViewer(ctx: ExtensionContext, target: Target): Promise<void> {
-	await ctx.ui.custom<void>((tui, theme, _keybindings, done) => new HtmlViewer(tui, theme, () => done(), target), {
-		overlay: true,
-		overlayOptions: FULLSCREEN,
-	});
+	await ctx.ui.custom<void>((ui, theme, _keybindings, done) => new HtmlViewer(ui, theme, () => done(), target), FULLSCREEN);
 }
 
 // ── preview queue ───────────────────────────────────────────────────────────
@@ -689,7 +730,7 @@ const queue: Queued[] = [];
 /** UI of the interactive main session; subagents (no UI) queue through it. */
 let mainUi: ExtensionContext["ui"] | undefined;
 /** Set while the card widget is mounted. */
-let cardTui: TUI | undefined;
+let cardUi: UiHost | undefined;
 let cardMounted = false;
 
 function refreshCard(): void {
@@ -699,10 +740,10 @@ function refreshCard(): void {
 		return;
 	}
 	if (!cardMounted && mainUi) {
-		mainUi.setWidget(CARD_WIDGET, (tui, theme) => new QueueCard(tui, theme), { placement: "aboveEditor" });
+		mainUi.setWidget(CARD_WIDGET, (ui, theme) => new QueueCard(ui, theme), { placement: "aboveEditor" });
 		cardMounted = true;
 	}
-	cardTui?.requestRender();
+	cardUi?.requestRender();
 }
 
 function enqueue(target: Target): number {
@@ -728,7 +769,7 @@ function dismissAll(): void {
 const isQueued = (source: string): boolean => queue.some(q => q.source === source);
 
 function dropCardThumb(item: Queued): void {
-	if (item.thumb) cardTui?.terminal.write(encodeKittyDeleteImage(item.thumb.imageId));
+	if (item.thumb) writeTerminalSequence(deleteImage(item.thumb.imageId));
 	item.thumb = undefined;
 }
 
@@ -752,17 +793,17 @@ async function viewAndRecord(ctx: ExtensionContext, target: Target): Promise<voi
  *   │                │ alt+o open · alt+x dismiss · alt+shift+o library │
  *   ╰────────────────┴─────────────────┤ dismiss all · alt+shift+x ├───╯
  */
-class QueueCard implements Component {
-	#tui: TUI;
+class QueueCard implements Rows {
+	#ui: UiHost;
 	#theme: ViewerTheme;
 
-	constructor(tui: TUI, theme: ViewerTheme) {
-		this.#tui = tui;
+	constructor(ui: UiHost, theme: ViewerTheme) {
+		this.#ui = ui;
 		this.#theme = theme;
-		cardTui = tui;
+		cardUi = ui;
 	}
 
-	render(width: number): readonly string[] {
+	render(width: number): string[] {
 		const head = queue[0];
 		if (!head) return [];
 		this.#loadThumb(head);
@@ -771,14 +812,14 @@ class QueueCard implements Component {
 		const position = queue.length > 1 ? t.fg("dim", `1 of ${queue.length}`) : "";
 		const cardCols = THUMB_COLS + CARD_TEXT_COLS + 7;
 		if (width < cardCols + 2) {
-			const title = truncateToWidth(head.label, Math.max(8, width - 20));
+			const title = truncate(head.label, Math.max(8, width - 20));
 			const line = `${t.fg("accent", "▸")} ${link(t.bold(title))} ${t.fg("dim", `${SHORTCUT}${queued}`)}`;
 			return [" ".repeat(Math.max(0, width - 1 - visibleWidth(line))) + line];
 		}
 		const size = head.bytes !== undefined ? ` · ${formatBytes(head.bytes)}` : "";
 		// Truncate before linking, so a cut never drops the link's closing sequence.
 		const titleCols = CARD_TEXT_COLS - (position ? visibleWidth(position) + 2 : 0);
-		const title = link(t.bold(t.fg("accent", truncateToWidth(head.label, titleCols))));
+		const title = link(t.bold(t.fg("accent", truncate(head.label, titleCols))));
 		const text = [
 			pad(title, CARD_TEXT_COLS - visibleWidth(position)) + position,
 			fit(t.fg("muted", `${KIND_LABEL[head.kind]}${size} · ${ago(Date.now() - head.addedAt)}`), CARD_TEXT_COLS),
@@ -814,10 +855,8 @@ class QueueCard implements Component {
 		return lines;
 	}
 
-	invalidate(): void {}
-
 	dispose(): void {
-		if (cardTui === this.#tui) cardTui = undefined;
+		if (cardUi === this.#ui) cardUi = undefined;
 	}
 
 	#loadThumb(item: Queued): void {
@@ -826,13 +865,13 @@ class QueueCard implements Component {
 		renderThumb(item, THUMB_COLS, THUMB_ROWS).then(
 			png => {
 				if (!queue.includes(item)) return;
-				item.thumb = placeImage(this.#tui, png, THUMB_COLS, THUMB_ROWS);
+				item.thumb = placeImage(png, THUMB_COLS, THUMB_ROWS);
 				item.thumbState = "ready";
-				this.#tui.requestRender();
+				cardUi?.requestRender();
 			},
 			() => {
 				item.thumbState = "failed";
-				this.#tui.requestRender();
+				cardUi?.requestRender();
 			},
 		);
 	}
@@ -867,7 +906,7 @@ function forgetDialog(t: ViewerTheme, label: string): string[] {
 	const key = (k: string, what: string) => `${t.fg("accent", k)}  ${what}`;
 	return [
 		t.fg("dim", `╭${"─".repeat(inner + 2)}╮`),
-		row(t.bold(`Forget ${truncateToWidth(label, inner - 8)}?`)),
+		row(t.bold(`Forget ${truncate(label, inner - 8)}?`)),
 		row(t.fg("muted", "It leaves the library; the file stays.")),
 		row(""),
 		row(key("y", "yes")),
@@ -880,8 +919,8 @@ function forgetDialog(t: ViewerTheme, label: string): string[] {
 /** `line` with `over` drawn from column `col`; `line` must not hold image cells. */
 function drawOver(line: string, over: string, col: number): string {
 	const end = col + visibleWidth(over);
-	const rest = sliceByColumn(line, end, Math.max(0, visibleWidth(line) - end), true);
-	return `${pad(sliceByColumn(line, 0, col, true), col)}\x1b[0m${over}\x1b[0m${rest}`;
+	const rest = sliceCells(line, end, Math.max(0, visibleWidth(line) - end), true).text;
+	return `${pad(sliceCells(line, 0, col, true).text, col)}\x1b[0m${over}\x1b[0m${rest}`;
 }
 
 /**
@@ -894,15 +933,16 @@ function drawOver(line: string, over: string, col: number): string {
  *   ▌              HTML · 217 KB · ~/reports
  *   ▌              quarterly-report.html
  *
- * Type to filter; enter or a click opens the viewer on top of the list.
+ * Type to filter; enter (or a click, with omp's `tui.mouse` on) opens the viewer on top of the list.
  */
-class ArtifactLibrary implements Component {
-	#tui: TUI;
+class ArtifactLibrary implements Rows {
+	#ui: UiHost;
 	#theme: ViewerTheme;
 	#done: () => void;
 	#cwd: string;
 	#allProjects = false;
-	#handle?: OverlayHandle;
+	#ctx: ExtensionContext;
+	#unsubscribe: () => void;
 	#all: LibraryEntry[] = loadLibrary();
 	#filter = "";
 	#selected = 0;
@@ -916,20 +956,18 @@ class ArtifactLibrary implements Component {
 	#status = "";
 	#disposed = false;
 
-	constructor(tui: TUI, theme: ViewerTheme, done: () => void, cwd: string) {
-		this.#tui = tui;
+	constructor(ui: UiHost, theme: ViewerTheme, done: () => void, ctx: ExtensionContext) {
+		this.#ui = ui;
 		this.#theme = theme;
 		this.#done = done;
-		this.#cwd = cwd;
+		this.#ctx = ctx;
+		this.#cwd = ctx.cwd;
+		this.#unsubscribe = onMouse(mouse => this.#mouse(mouse));
 	}
 
-	setHandle(handle: OverlayHandle): void {
-		this.#handle = handle;
-	}
-
-	render(width: number): readonly string[] {
+	render(width: number): string[] {
 		const t = this.#theme;
-		const rows = Math.max(8, this.#tui.terminal.rows);
+		const rows = Math.max(8, this.#ui.size().rows);
 		const items = this.#items();
 		this.#visible = Math.max(1, Math.floor((rows - LIB_HEADER_ROWS - LIB_FOOTER_ROWS) / ITEM_ROWS));
 		this.#selected = Math.min(Math.max(0, this.#selected), Math.max(0, items.length - 1));
@@ -964,7 +1002,7 @@ class ArtifactLibrary implements Component {
 			const info = this.#info(e);
 			const thumb = this.#thumb(e, info !== undefined || !e.file);
 			const age = t.fg("dim", ago(Date.now() - e.lastShownAt));
-			const name = truncateToWidth(e.label, Math.max(4, textCols - visibleWidth(age) - 2));
+			const name = truncate(e.label, Math.max(4, textCols - visibleWidth(age) - 2));
 			const head = selected ? t.bold(t.fg("accent", name)) : t.bold(name);
 			const where = e.file ? tildify(path.dirname(e.file)) : e.source;
 			const meta = `${KIND_LABEL[e.kind]}${info ? ` · ${formatBytes(info.bytes)}` : ""}${e.file ? ` · ${where}` : ""}`;
@@ -993,39 +1031,40 @@ class ArtifactLibrary implements Component {
 			}
 		}
 		lines.push(t.fg("dim", "─".repeat(width)));
-		const help = `tab ${this.#allProjects ? "this project" : "all projects"} · ↑↓ wheel move · enter click open · ctrl+d forget · ctrl+o browser · esc close`;
+		const help = `tab ${this.#allProjects ? "this project" : "all projects"} · ↑↓ move · enter open · ctrl+d forget · ctrl+o browser · esc close`;
 		const status = this.#status ? `${t.fg("warning", this.#status)}  ` : "";
-		lines.push(truncateToWidth(` ${status}${t.fg("dim", help)}`, width));
+		lines.push(truncate(` ${status}${t.fg("dim", help)}`, width));
 		return lines;
+	}
+
+	#mouse(mouse: MouseEvent): void {
+		if (this.#viewing || this.#confirm) return;
+		if (mouse.button === "wheel-down") this.#move(1);
+		else if (mouse.button === "wheel-up") this.#move(-1);
+		else if (mouse.button === "left" && mouse.action === "press") {
+			const slot = mouse.row - LIB_HEADER_ROWS;
+			const index = this.#top + Math.floor(slot / ITEM_ROWS);
+			if (slot >= 0 && slot < this.#visible * ITEM_ROWS && index < this.#items().length) {
+				this.#selected = index;
+				this.#open();
+			}
+		}
 	}
 
 	handleInput(data: string): void {
 		if (this.#viewing) return;
+		const key = keyOf(data);
 		if (this.#confirm) {
-			if (routeSgrMouseInput(data, () => true) || isKeyRelease(data)) return;
-			const answer = FORGET_KEYS[parseKey(data) ?? ""];
+			const answer = FORGET_KEYS[key?.id ?? ""];
 			if (!answer) return;
 			const e = this.#confirm;
 			this.#confirm = undefined;
 			if (answer === "always") askBeforeForget = false;
-			if (answer === "no") return this.#tui.requestRender();
+			if (answer === "no") return this.#ui.requestRender();
 			return this.#forgetNow(e);
 		}
-		const isMouse = routeSgrMouseInput(data, event => {
-			if (event.wheel) this.#move(event.wheel);
-			else if (event.leftClick) {
-				const slot = event.row - LIB_HEADER_ROWS;
-				const index = this.#top + Math.floor(slot / ITEM_ROWS);
-				if (slot >= 0 && slot < this.#visible * ITEM_ROWS && index < this.#items().length) {
-					this.#selected = index;
-					this.#open();
-				}
-			}
-			return true;
-		});
-		if (isMouse || isKeyRelease(data)) return;
 		this.#status = "";
-		switch (parseKey(data)) {
+		switch (key?.id) {
 			case "up":
 			case "ctrl+p":
 				return this.#move(-1);
@@ -1044,7 +1083,6 @@ class ArtifactLibrary implements Component {
 				this.#allProjects = !this.#allProjects;
 				return this.#setFilter(this.#filter);
 			case "enter":
-			case "return":
 				return this.#open();
 			case "escape":
 				if (!this.#filter) return this.#done();
@@ -1061,18 +1099,16 @@ class ArtifactLibrary implements Component {
 				return;
 			}
 		}
-		const text = extractPrintableText(data);
-		if (text) this.#setFilter(this.#filter + text);
+		if (key?.text) this.#setFilter(this.#filter + key.text);
 	}
-
-	invalidate(): void {}
 
 	dispose(): void {
 		if (this.#disposed) return;
 		this.#disposed = true;
+		this.#unsubscribe();
 		let deletes = "";
-		for (const thumb of this.#thumbs.values()) if (typeof thumb === "object") deletes += encodeKittyDeleteImage(thumb.imageId);
-		if (deletes) this.#tui.terminal.write(deletes);
+		for (const thumb of this.#thumbs.values()) if (typeof thumb === "object") deletes += deleteImage(thumb.imageId);
+		if (deletes) writeTerminalSequence(deletes);
 	}
 
 	/** Entries of the current scope, before the text filter. */
@@ -1108,12 +1144,12 @@ class ArtifactLibrary implements Component {
 			renderThumb(e, THUMB_COLS, THUMB_ROWS).then(
 				png => {
 					if (this.#disposed) return;
-					this.#thumbs.set(e.source, placeImage(this.#tui, png, THUMB_COLS, THUMB_ROWS));
-					this.#tui.requestRender();
+					this.#thumbs.set(e.source, placeImage(png, THUMB_COLS, THUMB_ROWS));
+					this.#ui.requestRender();
 				},
 				() => {
 					this.#thumbs.set(e.source, "failed");
-					this.#tui.requestRender();
+					this.#ui.requestRender();
 				},
 			);
 		}
@@ -1122,19 +1158,19 @@ class ArtifactLibrary implements Component {
 
 	#move(delta: number): void {
 		this.#selected = Math.max(0, Math.min(this.#items().length - 1, this.#selected + delta));
-		this.#tui.requestRender();
+		this.#ui.requestRender();
 	}
 
 	#setFilter(filter: string): void {
 		this.#filter = filter;
 		this.#selected = 0;
 		this.#top = 0;
-		this.#tui.requestRender();
+		this.#ui.requestRender();
 	}
 
 	#say(message: string): void {
 		this.#status = message;
-		this.#tui.requestRender();
+		this.#ui.requestRender();
 	}
 
 	#forget(): void {
@@ -1142,7 +1178,7 @@ class ArtifactLibrary implements Component {
 		if (!e) return;
 		if (!askBeforeForget) return this.#forgetNow(e);
 		this.#confirm = e;
-		this.#tui.requestRender();
+		this.#ui.requestRender();
 	}
 
 	#forgetNow(e: LibraryEntry): void {
@@ -1151,40 +1187,24 @@ class ArtifactLibrary implements Component {
 		this.#say(`forgot ${e.label} (the file stays)`);
 	}
 
-	/** Shows the viewer over the list; the list is hidden meanwhile so its thumbnails cannot bleed through. */
+	/** Shows the viewer over the list; a fullscreen layer replaces the list while it is up, so thumbnails cannot bleed through. */
 	#open(): void {
 		const e = this.#items()[this.#selected];
 		if (!e) return;
 		if (e.file && !this.#info(e)) return this.#say(`file is gone: ${e.file}`);
 		this.#viewing = true;
-		let overlay: OverlayHandle | undefined;
-		const viewer = new HtmlViewer(
-			this.#tui,
-			this.#theme,
-			() => {
-				overlay?.hide();
-				viewer.dispose();
-				this.#handle?.setHidden(false);
+		openViewer(this.#ctx, e)
+			.catch(err => this.#say(String(err)))
+			.finally(() => {
 				this.#viewing = false;
 				dequeue(e.source);
-				this.#tui.requestRender();
-			},
-			e,
-		);
-		overlay = this.#tui.showOverlay(viewer, FULLSCREEN);
-		this.#handle?.setHidden(true);
+				this.#ui.requestRender();
+			});
 	}
 }
 
 async function openLibrary(ctx: ExtensionContext): Promise<void> {
-	let library: ArtifactLibrary | undefined;
-	await ctx.ui.custom<void>(
-		(tui, theme, _keybindings, done) => {
-			library = new ArtifactLibrary(tui, theme, () => done(), ctx.cwd);
-			return library;
-		},
-		{ overlay: true, overlayOptions: FULLSCREEN, onHandle: handle => library?.setHandle(handle) },
-	);
+	await ctx.ui.custom<void>((ui, theme, _keybindings, done) => new ArtifactLibrary(ui, theme, () => done(), ctx), FULLSCREEN);
 }
 
 /**

@@ -32,7 +32,7 @@ plugins). Requirements:
 
 | | |
 |---|---|
-| omp | built and tested on 18.3.1 |
+| omp | 19.2 or newer (its rebuilt terminal UI); tested on 19.2.1. Versions up to 0.8.0 need omp 19.1 or older |
 | Terminal | [kitty](https://sw.kovidgoyal.net/kitty/) (tested on 0.48); needs its graphics protocol with Unicode placeholders. Ghostty supports the same protocol but is untested |
 | Browser | none of its own: pages render in the headless Chromium omp already runs for its `browser` tool |
 | PDF | `pdftoppm` from poppler (only for PDFs) |
